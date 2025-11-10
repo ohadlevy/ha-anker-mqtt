@@ -4,6 +4,9 @@
 
 This Docker container publishes data from Anker Solix devices to Home Assistant via MQTT discovery.
 
+![Home Assistant Integration](screenshot.png)
+*Example of the automatic device integration with control switches and sensors*
+
 ## Quick Start
 
 1. Copy the environment template:
