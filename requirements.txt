@@ -1,7 +1,7 @@
 # Home Assistant MQTT Publisher for Anker Solix Devices
 
-# Anker Solix API library
-anker-solix-api>=2.4.0
+# Anker Solix API library from GitHub
+git+https://github.com/thomluther/anker-solix-api.git
 
 # MQTT client
 paho-mqtt>=1.6.0
