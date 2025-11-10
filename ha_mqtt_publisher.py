@@ -25,9 +25,9 @@ from typing import Any, Dict, Optional
 import paho.mqtt.client as mqtt_client
 from aiohttp import ClientSession
 
-from anker_solix_api.api import AnkerSolixApi
-from anker_solix_api.apitypes import SolixDeviceType
-from anker_solix_api.mqtt_c1000x import SolixMqttDeviceC1000x
+from api.api import AnkerSolixApi
+from api.apitypes import SolixDeviceType
+from api.mqtt_c1000x import SolixMqttDeviceC1000x
 
 # Try to load python-dotenv for .env file support
 try:
