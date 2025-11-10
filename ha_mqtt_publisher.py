@@ -1094,7 +1094,7 @@ class HomeAssistantMqttPublisher:
 
     def _get_sensor_definitions(self, device_type: str) -> dict:
         """Get all sensor definitions for a device type."""
-        from anker_solix_api.apitypes import SolixDeviceType
+        from api.apitypes import SolixDeviceType
 
         # Common sensors for all devices
         common_sensors = {
