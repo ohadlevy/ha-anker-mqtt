@@ -363,6 +363,19 @@ class HomeAssistantMqttPublisher:
                     device_name = dev.get('name', 'Unknown')
                     device_sn = dev.get('device_sn', 'Unknown')
 
+                    # Send occasional display wake-up for C1000X devices (every 6th keep-alive ~30min)
+                    if dev.get('device_pn') == 'A1761' and (current_time % 1800) < keepalive_interval:  # Every ~30 minutes
+                        logger.debug(f"💡 Keep-alive: Sending display wake-up for {device_name}...")
+                        try:
+                            device = create_mqtt_device(self.api, device_sn)
+                            if device:
+                                wake_result = await device.set_display(enabled=True)
+                                if wake_result:
+                                    logger.debug(f"✅ Keep-alive: Display wake-up successful for {device_name}")
+                                await asyncio.sleep(1)  # Brief pause after wake-up
+                        except Exception as e:
+                            logger.debug(f"⚠️ Keep-alive: Display wake-up error for {device_name}: {e}")
+
                     resp = self.api.mqttsession.realtime_trigger(
                         deviceDict=dev, timeout=30
                     )
@@ -428,6 +441,24 @@ class HomeAssistantMqttPublisher:
                     for dev in mqtt_devices:
                         try:
                             device_name = dev.get('name', 'Unknown')
+                            device_sn = dev.get('device_sn', 'Unknown')
+
+                            # Send display wake-up command for C1000X devices first
+                            if dev.get('device_pn') == 'A1761':  # C1000X
+                                logger.info(f"💡 Recovery: Sending display wake-up for {device_name}...")
+                                try:
+                                    device = create_mqtt_device(self.api, device_sn)
+                                    if device:
+                                        wake_result = await device.set_display(enabled=True)
+                                        if wake_result:
+                                            logger.info(f"✅ Recovery: Display wake-up successful for {device_name}")
+                                        else:
+                                            logger.warning(f"⚠️ Recovery: Display wake-up failed for {device_name}")
+                                        # Give device time to process wake-up command
+                                        await asyncio.sleep(1)
+                                except Exception as e:
+                                    logger.warning(f"⚠️ Recovery: Display wake-up error for {device_name}: {e}")
+
                             resp = self.api.mqttsession.realtime_trigger(deviceDict=dev, timeout=30)
                             if resp and resp.is_published():
                                 logger.info(f"🔔 Recovery trigger sent to {device_name}")
@@ -1508,10 +1539,31 @@ class HomeAssistantMqttPublisher:
                 mqtt_session = await self.api.startMqttSession()
                 if mqtt_session:
                     # Subscribe to devices
+                    logger.info("🔍 DEBUG - MQTT Session Details:")
+                    logger.info(f"   📋 MQTT session type: {type(mqtt_session)}")
+                    logger.info(f"   🔌 Is connected: {mqtt_session.is_connected() if hasattr(mqtt_session, 'is_connected') else 'Unknown'}")
+                    if hasattr(mqtt_session, '__dict__'):
+                        logger.info(f"   📊 Session attributes: {list(mqtt_session.__dict__.keys())}")
+
                     for dev in self.api.devices.values():
                         if dev.get("mqtt_described"):
-                            topic = f"{mqtt_session.get_topic_prefix(deviceDict=dev)}#"
+                            device_name = dev.get('name', 'Unknown')
+                            device_sn = dev.get('device_sn', 'Unknown')
+                            topic_prefix = mqtt_session.get_topic_prefix(deviceDict=dev)
+                            topic = f"{topic_prefix}#"
+
+                            logger.info(f"🔍 DEBUG - Subscribing to device {device_name}:")
+                            logger.info(f"   📍 Topic prefix: {topic_prefix}")
+                            logger.info(f"   🎯 Full topic: {topic}")
+
                             resp = mqtt_session.subscribe(topic)
+
+                            logger.info(f"   📋 Subscription response: {type(resp) if resp else None}")
+                            if resp:
+                                logger.info(f"   ✅ Success: {not resp.is_failure if hasattr(resp, 'is_failure') else 'Unknown'}")
+                                if hasattr(resp, '__dict__'):
+                                    logger.info(f"   📊 Response attributes: {list(resp.__dict__.keys())}")
+
                             if resp and resp.is_failure:
                                 logger.warning(f"Failed subscription for topic: {topic}")
                     logger.info("MQTT session established")
@@ -1564,23 +1616,53 @@ class HomeAssistantMqttPublisher:
         logger.info(f"📡 MQTT callback: topic={topic_name}, device={device_sn}, valueupdate={valueupdate}")
         logger.debug(f"📋 Full topic: {topic}")
 
+        # ENHANCED DEBUGGING: Log raw message details
+        logger.info(f"🔍 DEBUG - Raw MQTT message details:")
+        logger.info(f"   📍 Full topic: {topic}")
+        logger.info(f"   📦 Message type: {type(message)}")
+        logger.info(f"   📊 Data type: {type(data)}")
+        logger.info(f"   🔢 Model: {model}")
+        logger.info(f"   🆔 Device SN: {device_sn}")
+        logger.info(f"   🔄 Value update flag: {valueupdate}")
+
+        # Log raw message content if available
+        if hasattr(message, 'payload'):
+            try:
+                payload_str = message.payload.decode('utf-8', errors='replace') if isinstance(message.payload, bytes) else str(message.payload)
+                logger.info(f"   📥 Raw payload: {payload_str[:200]}{'...' if len(payload_str) > 200 else ''}")
+            except Exception as e:
+                logger.info(f"   📥 Raw payload decode error: {e}")
+
         # Log what data we received
         if hasattr(data, 'keys') and len(data) > 0:
             logger.info(f"📊 Received {len(data)} fields from {topic_name}: {list(data.keys())}")
+            # Show ALL data for debugging (truncated)
+            if len(data) <= 20:
+                logger.info(f"🔋 All data from {topic_name}: {dict(data)}")
+            else:
+                logger.info(f"🔋 First 20 fields from {topic_name}: {dict(list(data.items())[:20])}")
             # Show sample values for important fields
             sample_fields = ['battery_soc', 'ac_output_power', 'temperature', 'dc_input_power', 'grid_to_battery_power']
             sample_data = {k: data.get(k) for k in sample_fields if k in data}
             if sample_data:
-                logger.info(f"🔋 Sample values from {topic_name}: {sample_data}")
+                logger.info(f"🔋 Key sample values from {topic_name}: {sample_data}")
         else:
             logger.info(f"📊 Received empty data from {topic_name}")
+            # Log if data exists but in different format
+            if data is not None:
+                logger.info(f"   🔍 Data is not None but not dict-like: {type(data)} = {str(data)[:100]}")
 
         # Also log the raw MQTT session cache data for comparison
         if device_sn and self.api.mqttsession and hasattr(self.api.mqttsession, 'mqtt_data'):
             session_data = self.api.mqttsession.mqtt_data.get(device_sn, {})
             if session_data:
+                logger.info(f"🗄️ Session cache has {len(session_data)} fields")
                 session_sample = {k: session_data.get(k) for k in ['ac_output_power', 'usbc_1_power', 'battery_soc'] if k in session_data}
                 logger.info(f"🗄️ Session cache sample: {session_sample}")
+            else:
+                logger.info(f"🗄️ Session cache is empty for device {device_sn}")
+        else:
+            logger.info(f"🗄️ No session cache available")
 
         if device_sn:
             try:
@@ -1662,10 +1744,51 @@ class HomeAssistantMqttPublisher:
                                 # Wait a bit more for MQTT client to be fully ready
                                 await asyncio.sleep(1)
 
+                                # Send display wake-up command for C1000X devices first
+                                if dev.get('device_pn') == 'A1761':  # C1000X
+                                    logger.info(f"💡 Sending display wake-up command for {device_name}...")
+                                    try:
+                                        device = create_mqtt_device(self.api, device_sn)
+                                        if device:
+                                            wake_result = await device.set_display(enabled=True)
+                                            if wake_result:
+                                                logger.info(f"✅ Display wake-up successful for {device_name}")
+                                            else:
+                                                logger.warning(f"⚠️ Display wake-up failed for {device_name}")
+                                            # Give device time to process wake-up command
+                                            await asyncio.sleep(2)
+                                        else:
+                                            logger.warning(f"⚠️ Could not create device instance for wake-up: {device_name}")
+                                    except Exception as e:
+                                        logger.warning(f"⚠️ Display wake-up error for {device_name}: {e}")
+
                                 logger.info(f"📡 Sending realtime trigger for {device_name}...")
+                                # DEBUG: Log what we're about to send
+                                logger.info(f"🔍 DEBUG - Realtime trigger details:")
+                                logger.info(f"   🎯 Target device: {device_name} ({device_sn})")
+                                logger.info(f"   🏷️ Device PN: {dev.get('device_pn')}")
+                                logger.info(f"   📡 MQTT described: {dev.get('mqtt_described')}")
+                                logger.info(f"   🔌 MQTT supported: {dev.get('mqtt_supported')}")
+                                logger.info(f"   ⏱️ Timeout: 60s")
+
                                 resp = self.api.mqttsession.realtime_trigger(
                                     deviceDict=dev, timeout=60
                                 )
+
+                                # DEBUG: Log the response
+                                logger.info(f"🔍 DEBUG - Realtime trigger response:")
+                                logger.info(f"   📋 Response object: {type(resp)}")
+                                logger.info(f"   ✅ Response exists: {resp is not None}")
+                                if resp:
+                                    logger.info(f"   📤 Is published: {resp.is_published() if hasattr(resp, 'is_published') else 'No is_published method'}")
+                                    if hasattr(resp, '__dict__'):
+                                        logger.info(f"   📊 Response attributes: {list(resp.__dict__.keys())}")
+                                    if hasattr(resp, 'topic'):
+                                        logger.info(f"   📍 Sent to topic: {resp.topic}")
+                                    if hasattr(resp, 'payload'):
+                                        logger.info(f"   📦 Payload: {str(resp.payload)[:100]}")
+                                else:
+                                    logger.warning(f"   ❌ No response object returned")
 
                                 if resp:
                                     # Wait for publish to complete
