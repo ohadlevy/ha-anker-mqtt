@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -27,7 +28,7 @@ from aiohttp import ClientSession
 
 from api.api import AnkerSolixApi
 from api.apitypes import SolixDeviceType
-from api.mqtt_c1000x import SolixMqttDeviceC1000x
+from api.mqtt_factory import create_mqtt_device
 
 # Try to load python-dotenv for .env file support
 try:
@@ -118,11 +119,16 @@ class HomeAssistantMqttPublisher:
         self.device_entities = {}  # Track which entities exist for each device
         self._pending_commands = []
         self._command_event = None  # Will be created when async loop starts
+        self._keepalive_enabled = True  # Track keep-alive state
+        self._last_keepalive = 0  # Track last keep-alive trigger
+        self._command_queue_timestamp = 0  # Track when commands were last added
+        self._max_command_wait_time = 60  # Maximum time to wait for command processing (seconds)
 
     def connect_mqtt(self) -> bool:
         """Connect to MQTT broker."""
         try:
-            self.mqtt_client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION1)
+            # Use modern VERSION2 callback API
+            self.mqtt_client = mqtt_client.Client(callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2)
             if self.mqtt_user and self.mqtt_password:
                 self.mqtt_client.username_pw_set(self.mqtt_user, self.mqtt_password)
 
@@ -137,14 +143,21 @@ class HomeAssistantMqttPublisher:
             logger.error(f"Failed to connect to MQTT broker: {e}")
             return False
 
-    def _on_mqtt_connect(self, client, userdata, flags, rc):
+    def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties):
         """Callback for MQTT connection."""
+        # Convert reason_code to int for backward compatibility
+        rc = reason_code.value if hasattr(reason_code, 'value') else reason_code
         if rc == 0:
             logger.info(f"Connected to MQTT broker at {self.mqtt_host}:{self.mqtt_port}")
             # Subscribe to command topics for all devices
             command_topic = f"{self.device_prefix}/+/command"
             client.subscribe(command_topic)
             logger.info(f"Subscribed to command topic: {command_topic}")
+
+            # Subscribe to global keep-alive control
+            keepalive_topic = f"{self.device_prefix}/keepalive/command"
+            client.subscribe(keepalive_topic)
+            logger.info(f"Subscribed to keep-alive control topic: {keepalive_topic}")
         else:
             error_messages = {
                 1: "Connection refused - incorrect protocol version",
@@ -158,8 +171,10 @@ class HomeAssistantMqttPublisher:
             if rc == 5:
                 logger.error("Check your MQTT username and password in the .env file")
 
-    def _on_mqtt_disconnect(self, client, userdata, rc):
+    def _on_mqtt_disconnect(self, client, userdata, flags, reason_code, properties):
         """Callback for MQTT disconnection."""
+        # Convert reason_code to int for backward compatibility
+        rc = reason_code.value if hasattr(reason_code, 'value') else reason_code
         if rc != 0:
             logger.warning("Unexpected MQTT disconnection")
 
@@ -168,15 +183,38 @@ class HomeAssistantMqttPublisher:
         try:
             topic_parts = msg.topic.split('/')
             if len(topic_parts) >= 3 and topic_parts[-1] == 'command':
+                # Handle keep-alive control commands
+                if topic_parts[-2] == 'keepalive':
+                    command_data = json.loads(msg.payload.decode())
+                    if command_data.get('command') == 'keepalive_toggle':
+                        enabled = command_data.get('enabled', False)
+                        self._keepalive_enabled = enabled
+                        logger.info(f"🔄 Keep-alive {'enabled' if enabled else 'disabled'} via MQTT command")
+
+                        # Publish the new state back
+                        state_topic = f"{self.device_prefix}/keepalive/state"
+                        self.mqtt_client.publish(state_topic, json.dumps({
+                            "keepalive_enabled": enabled,
+                            "last_updated": datetime.now().isoformat()
+                        }))
+                        return
+
+                # Handle device commands
                 device_sn = topic_parts[-2]
                 command_data = json.loads(msg.payload.decode())
                 logger.info(f"🎛️ Received command for {device_sn}: {command_data}")
 
                 # Store the command for processing in the main loop
                 self._pending_commands.append((device_sn, command_data))
+                self._command_queue_timestamp = time.time()
+                logger.info(f"🎛️ Command added to pending queue. Queue size: {len(self._pending_commands)}")
                 # Signal that commands are available for processing
                 if self._command_event:
+                    event_was_set = self._command_event.is_set()
                     self._command_event.set()
+                    logger.info(f"🎛️ Command event set (was_set={event_was_set}) - main loop should process immediately")
+                else:
+                    logger.error("🎛️ Command event is None - commands cannot be processed!")
 
         except Exception as e:
             logger.error(f"Error handling MQTT message: {e}")
@@ -184,50 +222,64 @@ class HomeAssistantMqttPublisher:
     async def _handle_device_command(self, device_sn: str, command_data: dict):
         """Handle device control commands."""
         try:
+            logger.info(f"🔄 Processing command for {device_sn}: {command_data}")
+
             command = command_data.get('command')
             if not command:
                 logger.error(f"No command specified in payload: {command_data}")
                 return
+            logger.info(f"🔄 Command extracted: {command}")
 
             # Get device info
             device_info = self.api.devices.get(device_sn) if self.api else None
             if not device_info:
                 logger.error(f"Device not found: {device_sn}")
                 return
+            logger.info(f"🔄 Device found: {device_info.get('name', device_sn)}")
 
             # Only handle commands for C1000X devices
             if device_info.get('device_pn') != 'A1761':
                 logger.error(f"Device {device_sn} does not support MQTT commands")
                 return
+            logger.info(f"🔄 Device model validated: A1761")
 
             # Check if MQTT session is connected
-            if not self.api.mqttsession or not self.api.mqttsession.is_connected():
+            if not self.api.mqttsession:
+                logger.error(f"❌ No MQTT session available for command: {command}")
+                return
+
+            if not self.api.mqttsession.is_connected():
                 logger.warning(f"🔄 MQTT session not connected, retrying command in 5 seconds...")
                 await asyncio.sleep(5)
                 # Try once more
-                if not self.api.mqttsession or not self.api.mqttsession.is_connected():
+                if not self.api.mqttsession.is_connected():
                     logger.error(f"❌ MQTT session still not connected, command failed: {command}")
                     return
+            logger.info(f"🔄 MQTT session is connected")
 
             # Create device control instance
-            device = SolixMqttDeviceC1000x(self.api, device_sn)
+            logger.info(f"🔄 Creating MQTT device control instance...")
+            device = create_mqtt_device(self.api, device_sn)
+            if not device:
+                logger.error(f"Failed to create MQTT device instance for {device_sn}")
+                return
+            logger.info(f"🔄 Device control instance created: {type(device)}")
 
             # Execute command
             result = False
+            logger.info(f"🔄 Executing command: {command}")
+
             if command == "ac_output":
                 enabled = command_data.get('enabled', False)
+                logger.info(f"🔄 Calling device.set_ac_output(enabled={enabled})")
                 result = await device.set_ac_output(enabled=enabled)
                 logger.info(f"✅ AC output {'enabled' if enabled else 'disabled'} for {device_sn}")
 
             elif command == "dc_output":
                 enabled = command_data.get('enabled', False)
+                logger.info(f"🔄 Calling device.set_dc_output(enabled={enabled})")
                 result = await device.set_dc_output(enabled=enabled)
                 logger.info(f"✅ 12V DC output {'enabled' if enabled else 'disabled'} for {device_sn}")
-
-            elif command == "backup_charge":
-                enabled = command_data.get('enabled', False)
-                result = await device.set_backup_charge(enabled=enabled)
-                logger.info(f"✅ Backup charge mode {'enabled' if enabled else 'disabled'} for {device_sn}")
 
             elif command == "ultrafast_charging":
                 enabled = command_data.get('enabled', False)
@@ -244,6 +296,7 @@ class HomeAssistantMqttPublisher:
 
                     logger.info(f"✅ AC power detected ({grid_charging}W) - UltraFast charging can be enabled")
 
+                logger.info(f"🔄 Calling device.set_ultrafast_charging(enabled={enabled})")
                 result = await device.set_ultrafast_charging(enabled=enabled)
                 logger.info(f"✅ UltraFast charging {'enabled' if enabled else 'disabled'} for {device_sn}")
 
@@ -251,28 +304,154 @@ class HomeAssistantMqttPublisher:
                 logger.error(f"Unknown command: {command}")
                 return
 
+            logger.info(f"🔄 Command execution result: {result}")
+
             # Update device state if command was successful
             if result:
+                logger.info(f"🔄 Command successful, triggering state refresh...")
                 # Wait a moment for the device to update its state
                 await asyncio.sleep(1)
                 # Trigger a state refresh
                 if self.api.mqttsession:
                     self.api.mqttsession.realtime_trigger(deviceDict=device_info)
+                    logger.info(f"🔄 Realtime trigger sent")
 
         except Exception as e:
-            logger.error(f"Error executing command for {device_sn}: {e}")
+            logger.error(f"❌ Error executing command for {device_sn}: {e}", exc_info=True)
 
     async def _process_pending_commands(self):
         """Process any pending MQTT commands."""
         if self._pending_commands:
             pending = self._pending_commands.copy()
             self._pending_commands.clear()
-            # Clear the event after processing commands
-            if self._command_event:
-                self._command_event.clear()
+            logger.info(f"🎛️ Processing {len(pending)} pending commands")
 
             for device_sn, command_data in pending:
+                logger.info(f"🎛️ Processing command for device {device_sn}: {command_data}")
                 await self._handle_device_command(device_sn, command_data)
+
+            logger.debug("🎛️ Command processing completed")
+        else:
+            logger.debug("🎛️ No pending commands to process")
+
+        # Always clear the event after checking for commands
+        if self._command_event:
+            self._command_event.clear()
+            logger.debug("🎛️ Command event cleared")
+
+    async def _handle_keepalive_triggers(self):
+        """Send keep-alive realtime triggers if enabled."""
+        if not self._keepalive_enabled or not self.api or not self.api.mqttsession:
+            return
+
+        if not self.api.mqttsession.is_connected():
+            logger.debug("MQTT session not connected, skipping keep-alive triggers")
+            return
+
+        current_time = asyncio.get_event_loop().time()
+        keepalive_interval = 300  # 5 minutes default
+
+        # Check if it's time to send keep-alive triggers
+        if current_time - self._last_keepalive >= keepalive_interval:
+            logger.info("🔄 Sending keep-alive triggers to maintain MQTT session activity")
+
+            # Send realtime triggers to all MQTT-enabled devices
+            mqtt_devices = [dev for dev in self.api.devices.values() if dev.get("mqtt_described")]
+
+            for dev in mqtt_devices:
+                try:
+                    device_name = dev.get('name', 'Unknown')
+                    device_sn = dev.get('device_sn', 'Unknown')
+
+                    resp = self.api.mqttsession.realtime_trigger(
+                        deviceDict=dev, timeout=30
+                    )
+
+                    if resp and resp.is_published():
+                        logger.debug(f"✅ Keep-alive trigger sent to {device_name}")
+                    else:
+                        logger.warning(f"❌ Keep-alive trigger failed for {device_name}")
+
+                except Exception as e:
+                    logger.warning(f"Keep-alive trigger error for {dev.get('name', 'Unknown')}: {e}")
+
+            self._last_keepalive = current_time
+            logger.info(f"🔄 Keep-alive cycle completed for {len(mqtt_devices)} devices")
+
+    async def _check_and_recover_stale_commands(self):
+        """Check for stale commands and restart MQTT session if needed."""
+        if not self._pending_commands or not self._command_queue_timestamp:
+            return
+
+        current_time = time.time()
+        time_since_commands_added = current_time - self._command_queue_timestamp
+
+        if time_since_commands_added > self._max_command_wait_time:
+            logger.warning(f"🚨 Commands have been pending for {time_since_commands_added:.1f}s (max: {self._max_command_wait_time}s)")
+            logger.warning(f"🚨 {len(self._pending_commands)} commands stuck in queue - restarting MQTT session")
+
+            # Log the stuck commands for debugging
+            for i, (device_sn, command_data) in enumerate(self._pending_commands[:3]):  # Log first 3
+                logger.warning(f"   📋 Stuck command {i+1}: {device_sn} -> {command_data}")
+
+            await self._restart_mqtt_session()
+
+    async def _restart_mqtt_session(self):
+        """Restart the MQTT session to recover from stale state."""
+        try:
+            logger.info("🔄 Restarting MQTT session to recover from stale commands...")
+
+            # Stop current MQTT session
+            if self.api and self.api.mqttsession:
+                self.api.stopMqttSession()
+                await asyncio.sleep(2)  # Give it time to clean up
+
+            # Restart MQTT session
+            if self.api:
+                mqtt_session = await self.api.startMqttSession()
+                if mqtt_session:
+                    # Re-subscribe to devices
+                    for dev in self.api.devices.values():
+                        if dev.get("mqtt_described"):
+                            topic = f"{mqtt_session.get_topic_prefix(deviceDict=dev)}#"
+                            resp = mqtt_session.subscribe(topic)
+                            if resp and resp.is_failure:
+                                logger.warning(f"Failed resubscription for topic: {topic}")
+
+                    # Set up callback again
+                    self.api.mqttsession.message_callback(self.mqtt_message_callback)
+
+                    # Send realtime triggers to wake up devices
+                    await asyncio.sleep(3)  # Wait for connection to stabilize
+
+                    mqtt_devices = [dev for dev in self.api.devices.values() if dev.get("mqtt_described")]
+                    for dev in mqtt_devices:
+                        try:
+                            device_name = dev.get('name', 'Unknown')
+                            resp = self.api.mqttsession.realtime_trigger(deviceDict=dev, timeout=30)
+                            if resp and resp.is_published():
+                                logger.info(f"🔔 Recovery trigger sent to {device_name}")
+                            else:
+                                logger.warning(f"❌ Recovery trigger failed for {device_name}")
+                        except Exception as e:
+                            logger.warning(f"Recovery trigger error for {dev.get('name', 'Unknown')}: {e}")
+
+                    # Clear stuck commands and reset timestamp
+                    stuck_count = len(self._pending_commands)
+                    self._pending_commands.clear()
+                    self._command_queue_timestamp = 0
+
+                    # Reset command event
+                    if self._command_event:
+                        self._command_event.clear()
+
+                    logger.info(f"✅ MQTT session restarted successfully, cleared {stuck_count} stuck commands")
+
+                else:
+                    logger.error("❌ Failed to restart MQTT session")
+
+        except Exception as e:
+            logger.error(f"❌ Error during MQTT session restart: {e}", exc_info=True)
 
     def publish_discovery_config(self, device_sn: str, device_info: dict, entity_type: str,
                                entity_name: str, entity_config: dict):
@@ -716,7 +895,7 @@ class HomeAssistantMqttPublisher:
                     "device_class": "outlet",
                     "command_topic": f"{self.device_prefix}/{device_sn}/command",
                     "state_topic": f"{self.device_prefix}/{device_sn}/state",
-                    "value_template": "{% if value_json.switch_ac_output_power == 1 %}ON{% else %}OFF{% endif %}",
+                    "value_template": "{% if value_json.ac_output_power_switch == 1 %}ON{% else %}OFF{% endif %}",
                     "payload_on": '{"command": "ac_output", "enabled": true}',
                     "payload_off": '{"command": "ac_output", "enabled": false}',
                     "state_on": "ON",
@@ -727,23 +906,11 @@ class HomeAssistantMqttPublisher:
                     "icon": "mdi:car-battery",
                     "command_topic": f"{self.device_prefix}/{device_sn}/command",
                     "state_topic": f"{self.device_prefix}/{device_sn}/state",
-                    "value_template": "{% if value_json.switch_12v_dc_output_power == 1 %}ON{% else %}OFF{% endif %}",
+                    "value_template": "{% if value_json.dc_output_power_switch == 1 %}ON{% else %}OFF{% endif %}",
                     "payload_on": '{"command": "dc_output", "enabled": true}',
                     "payload_off": '{"command": "dc_output", "enabled": false}',
                     "state_on": "ON",
                     "state_off": "OFF"
-                },
-                "backup_charge": {
-                    "name": "Backup Charge Mode",
-                    "icon": "mdi:battery-charging-100",
-                    "command_topic": f"{self.device_prefix}/{device_sn}/command",
-                    "state_topic": f"{self.device_prefix}/{device_sn}/state",
-                    "value_template": "{% if value_json.backup_charge == 1 %}ON{% else %}OFF{% endif %}",
-                    "payload_on": '{"command": "backup_charge", "enabled": true}',
-                    "payload_off": '{"command": "backup_charge", "enabled": false}',
-                    "state_on": "ON",
-                    "state_off": "OFF",
-                    "entity_category": "config"
                 },
                 "ultrafast_charging": {
                     "name": "UltraFast Charging",
@@ -758,6 +925,11 @@ class HomeAssistantMqttPublisher:
                     "entity_category": "config"
                 }
             })
+
+        # Force republish of switches by clearing cache first
+        switches_to_clear = [f"{device_sn}_ac_output", f"{device_sn}_dc_12v_output", f"{device_sn}_ultrafast_charging"]
+        for switch_key in switches_to_clear:
+            self.published_discoveries.discard(switch_key)
 
         # Publish switch configurations
         for switch_name, switch_config in switches.items():
@@ -798,6 +970,64 @@ class HomeAssistantMqttPublisher:
                     device_sn, device_info, "binary_sensor", sensor_name, sensor_config
                 )
 
+    def create_keepalive_switch(self):
+        """Create global keep-alive switch for controlling MQTT session activity."""
+        if not self.mqtt_client:
+            logger.debug("MQTT client not available, skipping keep-alive switch creation")
+            return
+
+        # Create a virtual device for global controls
+        global_device_info = {
+            "identifiers": [f"{self.device_prefix}_global"],
+            "name": f"Anker Solix MQTT Publisher",
+            "model": "MQTT Publisher",
+            "manufacturer": "Anker Solix API",
+            "sw_version": "1.0",
+        }
+
+        switch_config = {
+            "name": "Keep-Alive Mode",
+            "icon": "mdi:heart-pulse",
+            "device_class": "switch",
+            "command_topic": f"{self.device_prefix}/keepalive/command",
+            "state_topic": f"{self.device_prefix}/keepalive/state",
+            "value_template": "{% if value_json.keepalive_enabled %}ON{% else %}OFF{% endif %}",
+            "payload_on": '{"command": "keepalive_toggle", "enabled": true}',
+            "payload_off": '{"command": "keepalive_toggle", "enabled": false}',
+            "state_on": "ON",
+            "state_off": "OFF",
+            "entity_category": "config",
+            "device": global_device_info,
+            "unique_id": f"{self.device_prefix}_global_keepalive",
+            "default_entity_id": f"switch.{self.device_prefix}_keepalive_mode",
+            "availability_topic": f"{self.device_prefix}/global/availability",
+            "payload_available": "online",
+            "payload_not_available": "offline"
+        }
+
+        # Publish discovery topic
+        discovery_topic = f"{self.ha_discovery_prefix}/switch/{self.device_prefix}_global/keepalive/config"
+
+        try:
+            result = self.mqtt_client.publish(discovery_topic, json.dumps(switch_config), retain=True)
+            if result.rc == mqtt_client.MQTT_ERR_SUCCESS:
+                logger.info(f"🔄 Published keep-alive switch discovery: {discovery_topic}")
+
+                # Publish initial state and availability
+                self.mqtt_client.publish(f"{self.device_prefix}/global/availability", "online", retain=True)
+                initial_state = {
+                    "keepalive_enabled": self._keepalive_enabled,
+                    "last_updated": datetime.now().isoformat()
+                }
+                self.mqtt_client.publish(f"{self.device_prefix}/keepalive/state", json.dumps(initial_state), retain=True)
+                return True
+            else:
+                logger.error(f"Failed to publish keep-alive switch discovery: {result.rc}")
+                return False
+        except Exception as e:
+            logger.error(f"Error publishing keep-alive switch discovery: {e}")
+            return False
+
     def publish_device_state(self, device_sn: str, device_info: dict, mqtt_data: dict = None):
         """Publish device state data to MQTT."""
         if not self.mqtt_client:
@@ -816,36 +1046,34 @@ class HomeAssistantMqttPublisher:
             logger.debug(f"🔍 Available state fields: {list(state_data.keys())}")
 
             # Get actual switch states from MQTT data (these are the real device states)
-            ac_switch_state = state_data.get('switch_ac_output_power')
-            dc_switch_state = state_data.get('switch_12v_dc_output_power')
-            backup_state = state_data.get('backup_charge', 0)
+            ac_switch_state = state_data.get('ac_output_power_switch')
+            dc_switch_state = state_data.get('dc_output_power_switch')
             ultrafast_state = state_data.get('ultrafast_charging', 0)
 
             # Only override if we don't have the switch states in MQTT data
             if ac_switch_state is None:
                 # Fallback: If we don't have switch state, infer from power consumption
                 ac_power = float(state_data.get('ac_output_power', 0) or 0)
-                state_data['switch_ac_output_power'] = 1 if ac_power > 0 else 0
-                logger.debug(f"🔧 Inferring AC switch from power: {ac_power}W -> state={state_data['switch_ac_output_power']}")
+                state_data['ac_output_power_switch'] = 1 if ac_power > 0 else 0
+                logger.debug(f"🔧 Inferring AC switch from power: {ac_power}W -> state={state_data['ac_output_power_switch']}")
             else:
                 # Use actual switch state from MQTT
-                state_data['switch_ac_output_power'] = int(ac_switch_state)
+                state_data['ac_output_power_switch'] = int(ac_switch_state)
                 logger.debug(f"🔧 AC switch from MQTT: {ac_switch_state}")
 
             if dc_switch_state is None:
                 # Fallback: Default to OFF if no data
-                state_data['switch_12v_dc_output_power'] = 0
+                state_data['dc_output_power_switch'] = 0
                 logger.debug(f"🔧 DC switch defaulted to: 0")
             else:
                 # Use actual switch state from MQTT
-                state_data['switch_12v_dc_output_power'] = int(dc_switch_state)
+                state_data['dc_output_power_switch'] = int(dc_switch_state)
                 logger.debug(f"🔧 DC switch from MQTT: {dc_switch_state}")
 
-            # Set backup charge and ultrafast charging states
-            state_data['backup_charge'] = backup_state
+            # Set ultrafast charging state
             state_data['ultrafast_charging'] = ultrafast_state
 
-            logger.info(f"🔧 Switch states: AC={state_data['switch_ac_output_power']}, DC={state_data['switch_12v_dc_output_power']}, Backup={state_data['backup_charge']}, Ultra={state_data['ultrafast_charging']}")
+            logger.info(f"🔧 Switch states: AC={state_data.get('ac_output_power_switch', 'N/A')}, DC={state_data.get('dc_output_power_switch', 'N/A')}, Ultra={state_data['ultrafast_charging']}")
 
         # Add timestamp
         state_data["last_updated"] = datetime.now().isoformat()
@@ -1379,6 +1607,9 @@ class HomeAssistantMqttPublisher:
         # Initial device discovery and setup
         await self.publish_all_devices(site_id=site_id, enable_mqtt=enable_mqtt)
 
+        # Create keep-alive control switch
+        self.create_keepalive_switch()
+
         # Setup MQTT callback and realtime triggers if enabled
         if enable_mqtt and self.api.mqttsession:
             # Set up the MQTT callback for real-time updates
@@ -1455,9 +1686,10 @@ class HomeAssistantMqttPublisher:
                 logger.info("🔄 MQTT session active - updates will be published in real-time")
                 logger.info("   Use Ctrl+C to stop...")
 
-                # Very infrequent polling just to keep connection alive and handle any missed updates
-                poll_interval = max(300, interval * 10)  # At least 5 minutes, or 10x the original interval
-                logger.info(f"📅 Fallback polling every {poll_interval} seconds for connection health")
+                # Shorter polling for command processing, longer for health checks
+                command_check_interval = 30  # Check for stale commands every 30 seconds
+                health_check_interval = max(300, interval * 10)  # At least 5 minutes, or 10x the original interval
+                logger.info(f"📅 Command check every {command_check_interval}s, health check every {health_check_interval}s")
 
                 # Initialize health check timestamp and command event
                 self._last_health_check = asyncio.get_event_loop().time()
@@ -1466,15 +1698,35 @@ class HomeAssistantMqttPublisher:
 
                 while True:
                     try:
-                        # Wait for commands or timeout for health check
-                        await asyncio.wait_for(self._command_event.wait(), timeout=poll_interval)
-                        # Command received - process immediately
+                        # Wait for commands or timeout for command checking
+                        logger.debug(f"🎛️ Waiting for commands (event is_set={self._command_event.is_set()}, pending={len(self._pending_commands)})")
+                        await asyncio.wait_for(self._command_event.wait(), timeout=command_check_interval)
+                        # Command received - process all pending commands
+                        logger.info("🎛️ Command event triggered - processing pending commands")
                         await self._process_pending_commands()
+                        # Continue the loop to wait for next event or timeout
+                        continue
                     except asyncio.TimeoutError:
-                        # Timeout reached - do health check
-                        logger.debug("Performing periodic connection health check...")
-                        await self.api.update_sites(siteId=site_id)
-                        self._last_health_check = asyncio.get_event_loop().time()
+                        # Timeout reached - check for stale commands first
+                        current_time = asyncio.get_event_loop().time()
+
+                        # Check for stale commands and restart MQTT session if needed
+                        await self._check_and_recover_stale_commands()
+
+                        # Process any pending commands that might have arrived
+                        if self._pending_commands:
+                            logger.info("🎛️ Processing pending commands during timeout check")
+                            await self._process_pending_commands()
+
+                        # Check if it's time for a full health check
+                        time_since_health_check = current_time - self._last_health_check
+                        if time_since_health_check >= health_check_interval:
+                            logger.debug(f"⏰ Health check timeout reached (pending commands: {len(self._pending_commands)})")
+                            await self.api.update_sites(siteId=site_id)
+                            self._last_health_check = current_time
+
+                            # Send keep-alive triggers if enabled
+                            await self._handle_keepalive_triggers()
 
                         # Only publish fallback state during health check
                         for device_sn, device_info in self.api.devices.items():

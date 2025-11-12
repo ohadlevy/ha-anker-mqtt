@@ -3,8 +3,8 @@
 # Anker Solix API library from GitHub
 git+https://github.com/thomluther/anker-solix-api.git
 
-# MQTT client
-paho-mqtt>=1.6.0
+# MQTT client (match upstream API requirement)
+paho-mqtt>=2.1.0
 
 # HTTP client for async requests
 aiohttp>=3.8.0
