@@ -1239,8 +1239,53 @@ class HomeAssistantMqttPublisher:
         all_possible_sensors = self._get_sensor_definitions(device_type)
 
         # Add expansion sensors only if expansion pack is installed
+        # Enhanced debugging for expansion pack detection
+        expansion_fields = {
+            'expansion_packs': combined_data.get('expansion_packs'),
+            'expansion_packs_a?': combined_data.get('expansion_packs_a?'),
+            'expansion_packs_b?': combined_data.get('expansion_packs_b?'),
+            'expansion_packs_c?': combined_data.get('expansion_packs_c?'),
+            'exp_1_soc': combined_data.get('exp_1_soc'),
+            'exp_1_soh': combined_data.get('exp_1_soh'),
+            'exp_1_type': combined_data.get('exp_1_type'),
+            'exp_1_temperature': combined_data.get('exp_1_temperature'),
+            'battery_soc_total': combined_data.get('battery_soc_total'),
+            'sw_expansion': combined_data.get('sw_expansion'),
+        }
+
+        logger.info(f"🔍 EXPANSION DEBUG - All expansion-related fields for {device_sn}:")
+        for field, value in expansion_fields.items():
+            if value is not None:
+                logger.info(f"   📊 {field}: {value} (type: {type(value)})")
+            else:
+                logger.info(f"   ❌ {field}: None")
+
         expansion_packs = combined_data.get('expansion_packs', 0)
+        # Also check alternative expansion pack fields
+        alt_expansion_indicators = [
+            combined_data.get('expansion_packs_a?'),
+            combined_data.get('expansion_packs_b?'),
+            combined_data.get('expansion_packs_c?')
+        ]
+
+        # Check if any expansion indicator suggests expansion pack is present
+        has_expansion = False
         if expansion_packs and int(expansion_packs) > 0:
+            has_expansion = True
+            logger.info(f"🔋 EXPANSION DEBUG - Detected via 'expansion_packs': {expansion_packs}")
+        elif any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None):
+            has_expansion = True
+            logger.info(f"🔋 EXPANSION DEBUG - Detected via alternative fields: {alt_expansion_indicators}")
+        elif combined_data.get('exp_1_soc') is not None:
+            has_expansion = True
+            logger.info(f"🔋 EXPANSION DEBUG - Detected via exp_1_soc presence: {combined_data.get('exp_1_soc')}")
+        elif combined_data.get('exp_1_type') is not None:
+            has_expansion = True
+            logger.info(f"🔋 EXPANSION DEBUG - Detected via exp_1_type presence: {combined_data.get('exp_1_type')}")
+
+        logger.info(f"🔋 EXPANSION DEBUG - Final decision: has_expansion={has_expansion}")
+
+        if has_expansion:
             expansion_sensors = {
                 "battery_soc_total": {
                     "device_class": "battery",
@@ -1287,7 +1332,23 @@ class HomeAssistantMqttPublisher:
                 }
             }
             all_possible_sensors.update(expansion_sensors)
-            logger.info(f"  🔋 Adding expansion sensors (expansion_packs={expansion_packs})")
+            logger.info(f"  🔋 EXPANSION DEBUG - Adding expansion sensors")
+            logger.info(f"  🔋 EXPANSION DEBUG - Added sensor types: {list(expansion_sensors.keys())}")
+
+            # Log which expansion sensors will actually have data
+            for sensor_name, sensor_config in expansion_sensors.items():
+                has_data = sensor_name in combined_data
+                if not has_data and 'value_template' in sensor_config:
+                    import re
+                    template_match = re.search(r'value_json\.(\w+)', sensor_config['value_template'])
+                    if template_match:
+                        field_name = template_match.group(1)
+                        has_data = field_name in combined_data
+                        field_value = combined_data.get(field_name)
+                        logger.info(f"     📊 {sensor_name} -> {field_name}: {field_value} (has_data: {has_data})")
+                else:
+                    field_value = combined_data.get(sensor_name)
+                    logger.info(f"     📊 {sensor_name}: {field_value} (has_data: {has_data})")
 
         logger.info(f"  🎯 Checking {len(all_possible_sensors)} potential sensors for type '{device_type}'")
         logger.info(f"  📋 Available MQTT fields: {sorted(combined_data.keys())}")
@@ -1339,10 +1400,36 @@ class HomeAssistantMqttPublisher:
             self.cleanup_unused_discovery_entries(device_sn, new_entities)
 
             # Also clean up expansion sensors if no expansion installed
+            # Use the same enhanced detection logic as above
+            cleanup_expansion_fields = {
+                'expansion_packs': combined_data.get('expansion_packs'),
+                'expansion_packs_a?': combined_data.get('expansion_packs_a?'),
+                'expansion_packs_b?': combined_data.get('expansion_packs_b?'),
+                'expansion_packs_c?': combined_data.get('expansion_packs_c?'),
+                'exp_1_soc': combined_data.get('exp_1_soc'),
+                'exp_1_type': combined_data.get('exp_1_type'),
+            }
+
             expansion_packs = combined_data.get('expansion_packs', 0)
-            if not (expansion_packs and int(expansion_packs) > 0):
-                logger.info(f"🧹 Cleaning up expansion sensors (expansion_packs={expansion_packs})")
+            alt_expansion_indicators = [
+                combined_data.get('expansion_packs_a?'),
+                combined_data.get('expansion_packs_b?'),
+                combined_data.get('expansion_packs_c?')
+            ]
+
+            cleanup_has_expansion = (
+                (expansion_packs and int(expansion_packs) > 0) or
+                any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None) or
+                combined_data.get('exp_1_soc') is not None or
+                combined_data.get('exp_1_type') is not None
+            )
+
+            if not cleanup_has_expansion:
+                logger.info(f"🧹 EXPANSION DEBUG - Cleaning up expansion sensors")
+                logger.info(f"🧹 Cleanup detection fields: {cleanup_expansion_fields}")
                 self._cleanup_expansion_sensors(device_sn)
+            else:
+                logger.info(f"🔋 EXPANSION DEBUG - Keeping expansion sensors (expansion detected during cleanup check)")
 
             self._cleanup_done.add(cleanup_key)
 
