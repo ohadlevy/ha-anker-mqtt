@@ -829,7 +829,7 @@ class HomeAssistantMqttPublisher:
                 "battery_soc_total": {
                     "device_class": "battery",
                     "unit_of_measurement": "%",
-                    "value_template": "{% if value_json.expansion_packs and value_json.expansion_packs | int > 0 %}{{ value_json.battery_soc_total }}{% else %}{{ value_json.battery_soc }}{% endif %}",
+                    "value_template": "{% if value_json.battery_soc_total is defined and value_json.battery_soc_total is not none %}{{ value_json.battery_soc_total }}{% elif value_json.exp_1_soc is defined and value_json.battery_soc is defined %}{{ ((value_json.battery_soc|int + value_json.exp_1_soc|int) / 2)|round }}{% else %}{{ value_json.battery_soc }}{% endif %}",
                     "state_class": "measurement"
                 },
                 "exp_1_soc": {
@@ -1346,6 +1346,18 @@ class HomeAssistantMqttPublisher:
                         has_data = field_name in combined_data
                         field_value = combined_data.get(field_name)
                         logger.info(f"     📊 {sensor_name} -> {field_name}: {field_value} (has_data: {has_data})")
+
+                        # Special note for battery_soc_total
+                        if sensor_name == "battery_soc_total" and field_name == "battery_soc_total" and not has_data:
+                            main_soc = combined_data.get('battery_soc')
+                            exp_soc = combined_data.get('exp_1_soc')
+                            if main_soc is not None and exp_soc is not None:
+                                calculated_total = round((int(main_soc) + int(exp_soc)) / 2)
+                                logger.info(f"     ℹ️ Note: Device doesn't provide battery_soc_total field - will calculate from individual batteries")
+                                logger.info(f"     ℹ️ Calculation: main={main_soc}% + expansion={exp_soc}% = total={calculated_total}% (equal 1056Wh capacities)")
+                            else:
+                                logger.info(f"     ℹ️ Note: Device doesn't provide battery_soc_total field - will show main battery_soc instead")
+                                logger.info(f"     ℹ️ Individual batteries: main={main_soc}%, expansion={exp_soc}%")
                 else:
                     field_value = combined_data.get(sensor_name)
                     logger.info(f"     📊 {sensor_name}: {field_value} (has_data: {has_data})")
