@@ -300,6 +300,12 @@ class HomeAssistantMqttPublisher:
                 result = await device.set_ultrafast_charging(enabled=enabled)
                 logger.info(f"✅ UltraFast charging {'enabled' if enabled else 'disabled'} for {device_sn}")
 
+            elif command == "light_mode":
+                mode = command_data.get('mode', 0)
+                logger.info(f"🔄 Calling device.set_light(mode={mode})")
+                result = await device.set_light(mode=mode)
+                logger.info(f"✅ Light mode set to {mode} for {device_sn}")
+
             else:
                 logger.error(f"Unknown command: {command}")
                 return
@@ -966,6 +972,31 @@ class HomeAssistantMqttPublisher:
         for switch_name, switch_config in switches.items():
             self.publish_discovery_config(
                 device_sn, device_info, "switch", switch_name, switch_config
+            )
+
+    def create_select_entities(self, device_sn: str, device_info: dict, data: dict):
+        """Create select entities for device controls."""
+        device_type = device_info.get('type', '')
+        selects = {}
+
+        # Only add selects for PPS devices (C1000X) that support MQTT control
+        if device_type == SolixDeviceType.PPS.value and device_info.get('device_pn') == 'A1761':
+            selects.update({
+                "light_mode": {
+                    "name": "Light Mode",
+                    "icon": "mdi:lightbulb",
+                    "options": ["Off", "Low", "Medium", "High", "Blinking"],
+                    "command_topic": f"{self.device_prefix}/{device_sn}/command",
+                    "state_topic": f"{self.device_prefix}/{device_sn}/state",
+                    "value_template": "{% set modes = ['Off', 'Low', 'Medium', 'High', 'Blinking'] %}{{ modes[value_json.light_mode | int] if value_json.light_mode | int < 5 else 'Off' }}",
+                    "command_template": '{"command": "light_mode", "mode": {{ ["Off", "Low", "Medium", "High", "Blinking"].index(value) }}}'
+                }
+            })
+
+        # Publish select configurations
+        for select_name, select_config in selects.items():
+            self.publish_discovery_config(
+                device_sn, device_info, "select", select_name, select_config
             )
 
     def create_binary_sensor_entities(self, device_sn: str, device_info: dict, data: dict):
@@ -1697,6 +1728,7 @@ class HomeAssistantMqttPublisher:
                 self.create_sensor_entities(device_sn, device_info, device_info)
                 self.create_binary_sensor_entities(device_sn, device_info, device_info)
                 self.create_switch_entities(device_sn, device_info, device_info)
+                self.create_select_entities(device_sn, device_info, device_info)
 
                 # Track initial entities
                 initial_sensors = self._get_sensor_definitions(device_info.get('type', ''))
