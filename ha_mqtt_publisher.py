@@ -1276,12 +1276,23 @@ class HomeAssistantMqttPublisher:
         elif any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None):
             has_expansion = True
             logger.info(f"🔋 EXPANSION DEBUG - Detected via alternative fields: {alt_expansion_indicators}")
-        elif combined_data.get('exp_1_soc') is not None:
+        elif combined_data.get('exp_1_soc') is not None and int(combined_data.get('exp_1_soc', 0)) > 0:
             has_expansion = True
-            logger.info(f"🔋 EXPANSION DEBUG - Detected via exp_1_soc presence: {combined_data.get('exp_1_soc')}")
-        elif combined_data.get('exp_1_type') is not None:
-            has_expansion = True
-            logger.info(f"🔋 EXPANSION DEBUG - Detected via exp_1_type presence: {combined_data.get('exp_1_type')}")
+            logger.info(f"🔋 EXPANSION DEBUG - Detected via exp_1_soc with charge: {combined_data.get('exp_1_soc')}")
+        elif combined_data.get('exp_1_type') and str(combined_data.get('exp_1_type', '')).strip() and combined_data.get('exp_1_type') != '0':
+            # Check if exp_1_type has meaningful content (not empty, not "0")
+            exp_type = str(combined_data.get('exp_1_type', '')).strip()
+            if exp_type and exp_type != '0' and any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None):
+                has_expansion = True
+                logger.info(f"🔋 EXPANSION DEBUG - Detected via exp_1_type with alt indicators: {exp_type}")
+            else:
+                logger.info(f"🔋 EXPANSION DEBUG - exp_1_type exists but no other indicators: {exp_type}")
+
+        # Additional safeguard: if exp_1_soc is 0 and all alt indicators are 0, likely no expansion
+        if (combined_data.get('exp_1_soc') == 0 and
+            all(not val or int(val or 0) == 0 for val in alt_expansion_indicators)):
+            logger.info(f"🔋 EXPANSION DEBUG - All expansion indicators are 0 - likely no expansion installed")
+            has_expansion = False
 
         logger.info(f"🔋 EXPANSION DEBUG - Final decision: has_expansion={has_expansion}")
 
@@ -1432,9 +1443,13 @@ class HomeAssistantMqttPublisher:
             cleanup_has_expansion = (
                 (expansion_packs and int(expansion_packs) > 0) or
                 any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None) or
-                combined_data.get('exp_1_soc') is not None or
-                combined_data.get('exp_1_type') is not None
+                (combined_data.get('exp_1_soc') is not None and int(combined_data.get('exp_1_soc', 0)) > 0)
             )
+
+            # Additional safeguard for cleanup: if exp_1_soc is 0 and all alt indicators are 0
+            if (combined_data.get('exp_1_soc') == 0 and
+                all(not val or int(val or 0) == 0 for val in alt_expansion_indicators)):
+                cleanup_has_expansion = False
 
             if not cleanup_has_expansion:
                 logger.info(f"🧹 EXPANSION DEBUG - Cleaning up expansion sensors")
