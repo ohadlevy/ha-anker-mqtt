@@ -306,6 +306,24 @@ class HomeAssistantMqttPublisher:
                 result = await device.set_light(mode=mode)
                 logger.info(f"✅ Light mode set to {mode} for {device_sn}")
 
+            elif command == "display_mode":
+                mode = command_data.get('mode', 0)
+                logger.info(f"🔄 Calling device.set_display(mode={mode})")
+                result = await device.set_display(mode=mode)
+                logger.info(f"✅ Display brightness set to {mode} for {device_sn}")
+
+            elif command == "ac_output_mode":
+                mode = command_data.get('mode', 0)
+                logger.info(f"🔄 Calling device.set_ac_output(mode={mode})")
+                result = await device.set_ac_output(mode=mode)
+                logger.info(f"✅ AC output mode set to {mode} for {device_sn}")
+
+            elif command == "dc_output_mode":
+                mode = command_data.get('mode', 0)
+                logger.info(f"🔄 Calling device.set_dc_output(mode={mode})")
+                result = await device.set_dc_output(mode=mode)
+                logger.info(f"✅ DC output mode set to {mode} for {device_sn}")
+
             else:
                 logger.error(f"Unknown command: {command}")
                 return
@@ -874,11 +892,8 @@ class HomeAssistantMqttPublisher:
             # Check if the data exists in either the main data or in value_template references
             has_data = sensor_name in data
             if not has_data and 'value_template' in sensor_config:
-                # Extract the field name from value_template like "{{ value_json.battery_soc }}"
-                import re
-                template_match = re.search(r'value_json\.(\w+)', sensor_config['value_template'])
-                if template_match:
-                    field_name = template_match.group(1)
+                field_name = self._extract_field_name_from_template(sensor_config['value_template'])
+                if field_name:
                     has_data = field_name in data
                     if has_data:
                         logger.debug(f"  ✓ Found data for {sensor_name} -> {field_name}: {data.get(field_name)}")
@@ -905,10 +920,8 @@ class HomeAssistantMqttPublisher:
         for sensor_name, sensor_config in all_sensors.items():
             has_data = sensor_name in data
             if not has_data and 'value_template' in sensor_config:
-                import re
-                template_match = re.search(r'value_json\.(\w+)', sensor_config['value_template'])
-                if template_match:
-                    field_name = template_match.group(1)
+                field_name = self._extract_field_name_from_template(sensor_config['value_template'])
+                if field_name:
                     has_data = field_name in data
             if has_data:
                 created_sensors.append(sensor_name)
@@ -990,6 +1003,36 @@ class HomeAssistantMqttPublisher:
                     "state_topic": f"{self.device_prefix}/{device_sn}/state",
                     "value_template": "{% set modes = ['Off', 'Low', 'Medium', 'High', 'Blinking'] %}{{ modes[value_json.light_mode | int] if value_json.light_mode | int < 5 else 'Off' }}",
                     "command_template": '{"command": "light_mode", "mode": {{ ["Off", "Low", "Medium", "High", "Blinking"].index(value) }}}'
+                },
+                "display_mode": {
+                    "name": "Display Brightness",
+                    "icon": "mdi:brightness-6",
+                    "options": ["Off", "Low", "Medium", "High"],
+                    "command_topic": f"{self.device_prefix}/{device_sn}/command",
+                    "state_topic": f"{self.device_prefix}/{device_sn}/state",
+                    "value_template": "{% set modes = ['Off', 'Low', 'Medium', 'High'] %}{{ modes[value_json.display_mode | int] if value_json.display_mode | int < 4 else 'Off' }}",
+                    "command_template": '{"command": "display_mode", "mode": {{ ["Off", "Low", "Medium", "High"].index(value) }}}',
+                    "entity_category": "config"
+                },
+                "ac_output_mode": {
+                    "name": "AC Output Mode",
+                    "icon": "mdi:power-settings",
+                    "options": ["Smart", "Normal"],
+                    "command_topic": f"{self.device_prefix}/{device_sn}/command",
+                    "state_topic": f"{self.device_prefix}/{device_sn}/state",
+                    "value_template": "{% set modes = ['Smart', 'Normal'] %}{{ modes[value_json.ac_output_mode | int] if value_json.ac_output_mode | int < 2 else 'Smart' }}",
+                    "command_template": '{"command": "ac_output_mode", "mode": {{ ["Smart", "Normal"].index(value) }}}',
+                    "entity_category": "config"
+                },
+                "dc_output_mode": {
+                    "name": "DC Output Mode",
+                    "icon": "mdi:car-battery",
+                    "options": ["Smart", "Normal"],
+                    "command_topic": f"{self.device_prefix}/{device_sn}/command",
+                    "state_topic": f"{self.device_prefix}/{device_sn}/state",
+                    "value_template": "{% set modes = ['Smart', 'Normal'] %}{{ modes[value_json.dc_12v_output_mode | int] if value_json.dc_12v_output_mode | int < 2 else 'Smart' }}",
+                    "command_template": '{"command": "dc_output_mode", "mode": {{ ["Smart", "Normal"].index(value) }}}',
+                    "entity_category": "config"
                 }
             })
 
@@ -1024,10 +1067,9 @@ class HomeAssistantMqttPublisher:
         # Publish binary sensor configurations
         for sensor_name, sensor_config in binary_sensors.items():
             # Check if we have the required field for this binary sensor
-            import re
             template = sensor_config.get("value_template", "")
-            field_match = re.search(r'value_json\.(\w+)', template)
-            if field_match and field_match.group(1) in data:
+            field_name = self._extract_field_name_from_template(template)
+            if field_name and field_name in data:
                 self.publish_discovery_config(
                     device_sn, device_info, "binary_sensor", sensor_name, sensor_config
                 )
@@ -1188,6 +1230,19 @@ class HomeAssistantMqttPublisher:
         except Exception as e:
             logger.error(f"Error publishing device state: {e}")
             return False
+
+    def _extract_field_name_from_template(self, template: str) -> str | None:
+        """Extract field name from Jinja2 value template.
+
+        Supports both dot notation (value_json.field_name) and bracket notation (value_json['field_name']).
+        """
+        import re
+        # Try dot notation first: value_json.field_name
+        template_match = re.search(r'value_json\.(\w+)', template)
+        if not template_match:
+            # Try bracket notation: value_json['field_name']
+            template_match = re.search(r"value_json\['([^']+)'\]", template)
+        return template_match.group(1) if template_match else None
 
     def cleanup_unused_discovery_entries(self, device_sn: str, current_sensors: set):
         """Clean up unused MQTT discovery entries for removed sensors."""
@@ -1381,10 +1436,8 @@ class HomeAssistantMqttPublisher:
             for sensor_name, sensor_config in expansion_sensors.items():
                 has_data = sensor_name in combined_data
                 if not has_data and 'value_template' in sensor_config:
-                    import re
-                    template_match = re.search(r'value_json\.(\w+)', sensor_config['value_template'])
-                    if template_match:
-                        field_name = template_match.group(1)
+                    field_name = self._extract_field_name_from_template(sensor_config['value_template'])
+                    if field_name:
                         has_data = field_name in combined_data
                         field_value = combined_data.get(field_name)
                         logger.info(f"     📊 {sensor_name} -> {field_name}: {field_value} (has_data: {has_data})")
@@ -1414,10 +1467,8 @@ class HomeAssistantMqttPublisher:
             field_name = sensor_name
 
             if not has_data and 'value_template' in sensor_config:
-                import re
-                template_match = re.search(r'value_json\.(\w+)', sensor_config['value_template'])
-                if template_match:
-                    field_name = template_match.group(1)
+                field_name = self._extract_field_name_from_template(sensor_config['value_template'])
+                if field_name:
                     has_data = field_name in combined_data
 
             # Log what we're checking
@@ -1607,6 +1658,13 @@ class HomeAssistantMqttPublisher:
                     "value_template": "{{ value_json.battery_soh }}",
                     "state_class": "measurement",
                     "icon": "mdi:battery-heart"
+                },
+                "remaining_time_hours": {
+                    "device_class": "duration",
+                    "unit_of_measurement": "h",
+                    "value_template": "{{ value_json['remaining_time_hours?'] if value_json['remaining_time_hours?'] is defined else 0 }}",
+                    "state_class": "measurement",
+                    "icon": "mdi:timer-outline"
                 },
                 "rssi": {
                     "device_class": "signal_strength",
