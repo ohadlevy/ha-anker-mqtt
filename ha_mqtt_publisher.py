@@ -28,7 +28,7 @@ from aiohttp import ClientSession
 
 from api.api import AnkerSolixApi
 from api.apitypes import SolixDeviceType
-from api.mqtt_factory import create_mqtt_device
+from api.mqtt_factory import SolixMqttDeviceFactory
 
 # Try to load python-dotenv for .env file support
 try:
@@ -259,7 +259,7 @@ class HomeAssistantMqttPublisher:
 
             # Create device control instance
             logger.info(f"🔄 Creating MQTT device control instance...")
-            device = create_mqtt_device(self.api, device_sn)
+            device = SolixMqttDeviceFactory(self.api, device_sn).create_device()
             if not device:
                 logger.error(f"Failed to create MQTT device instance for {device_sn}")
                 return
@@ -391,7 +391,7 @@ class HomeAssistantMqttPublisher:
                     if dev.get('device_pn') == 'A1761' and (current_time % 1800) < keepalive_interval:  # Every ~30 minutes
                         logger.debug(f"💡 Keep-alive: Sending display wake-up for {device_name}...")
                         try:
-                            device = create_mqtt_device(self.api, device_sn)
+                            device = SolixMqttDeviceFactory(self.api, device_sn).create_device()
                             if device:
                                 wake_result = await device.set_display(enabled=True)
                                 if wake_result:
@@ -471,7 +471,7 @@ class HomeAssistantMqttPublisher:
                             if dev.get('device_pn') == 'A1761':  # C1000X
                                 logger.info(f"💡 Recovery: Sending display wake-up for {device_name}...")
                                 try:
-                                    device = create_mqtt_device(self.api, device_sn)
+                                    device = SolixMqttDeviceFactory(self.api, device_sn).create_device()
                                     if device:
                                         wake_result = await device.set_display(enabled=True)
                                         if wake_result:
@@ -1952,7 +1952,7 @@ class HomeAssistantMqttPublisher:
                                 if dev.get('device_pn') == 'A1761':  # C1000X
                                     logger.info(f"💡 Sending display wake-up command for {device_name}...")
                                     try:
-                                        device = create_mqtt_device(self.api, device_sn)
+                                        device = SolixMqttDeviceFactory(self.api, device_sn).create_device()
                                         if device:
                                             wake_result = await device.set_display(enabled=True)
                                             if wake_result:
