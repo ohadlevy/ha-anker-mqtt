@@ -121,8 +121,6 @@ class HomeAssistantMqttPublisher:
         self._command_event = None  # Will be created when async loop starts
         self._keepalive_enabled = True  # Track keep-alive state
         self._last_keepalive = 0  # Track last keep-alive trigger
-        self._command_queue_timestamp = 0  # Track when commands were last added
-        self._max_command_wait_time = 60  # Maximum time to wait for command processing (seconds)
 
     def connect_mqtt(self) -> bool:
         """Connect to MQTT broker."""
@@ -154,10 +152,6 @@ class HomeAssistantMqttPublisher:
             client.subscribe(command_topic)
             logger.info(f"Subscribed to command topic: {command_topic}")
 
-            # Subscribe to global keep-alive control
-            keepalive_topic = f"{self.device_prefix}/keepalive/command"
-            client.subscribe(keepalive_topic)
-            logger.info(f"Subscribed to keep-alive control topic: {keepalive_topic}")
         else:
             error_messages = {
                 1: "Connection refused - incorrect protocol version",
@@ -183,22 +177,6 @@ class HomeAssistantMqttPublisher:
         try:
             topic_parts = msg.topic.split('/')
             if len(topic_parts) >= 3 and topic_parts[-1] == 'command':
-                # Handle keep-alive control commands
-                if topic_parts[-2] == 'keepalive':
-                    command_data = json.loads(msg.payload.decode())
-                    if command_data.get('command') == 'keepalive_toggle':
-                        enabled = command_data.get('enabled', False)
-                        self._keepalive_enabled = enabled
-                        logger.info(f"🔄 Keep-alive {'enabled' if enabled else 'disabled'} via MQTT command")
-
-                        # Publish the new state back
-                        state_topic = f"{self.device_prefix}/keepalive/state"
-                        self.mqtt_client.publish(state_topic, json.dumps({
-                            "keepalive_enabled": enabled,
-                            "last_updated": datetime.now().isoformat()
-                        }))
-                        return
-
                 # Handle device commands
                 device_sn = topic_parts[-2]
                 command_data = json.loads(msg.payload.decode())
@@ -206,7 +184,6 @@ class HomeAssistantMqttPublisher:
 
                 # Store the command for processing in the main loop
                 self._pending_commands.append((device_sn, command_data))
-                self._command_queue_timestamp = time.time()
                 logger.info(f"🎛️ Command added to pending queue. Queue size: {len(self._pending_commands)}")
                 # Signal that commands are available for processing
                 if self._command_event:
@@ -249,13 +226,8 @@ class HomeAssistantMqttPublisher:
                 return
 
             if not self.api.mqttsession.is_connected():
-                logger.warning(f"🔄 MQTT session not connected, retrying command in 5 seconds...")
-                await asyncio.sleep(5)
-                # Try once more
-                if not self.api.mqttsession.is_connected():
-                    logger.error(f"❌ MQTT session still not connected, command failed: {command}")
-                    return
-            logger.info(f"🔄 MQTT session is connected")
+                logger.error(f"❌ MQTT session not connected, command failed: {command}")
+                return
 
             # Create device control instance
             logger.info(f"🔄 Creating MQTT device control instance...")
@@ -324,6 +296,15 @@ class HomeAssistantMqttPublisher:
                 result = await device.set_dc_output(mode=mode)
                 logger.info(f"✅ DC output mode set to {mode} for {device_sn}")
 
+            elif command == "keepalive_toggle":
+                enabled = command_data.get('enabled', False)
+                logger.info(f"🔄 Keepalive {'enabled' if enabled else 'disabled'} for device {device_sn}")
+                # Store per-device keepalive state
+                if not hasattr(self, '_device_keepalive'):
+                    self._device_keepalive = {}
+                self._device_keepalive[device_sn] = enabled
+                result = True  # This is a local setting, always succeeds
+
             else:
                 logger.error(f"Unknown command: {command}")
                 return
@@ -364,25 +345,34 @@ class HomeAssistantMqttPublisher:
             logger.debug("🎛️ Command event cleared")
 
     async def _handle_keepalive_triggers(self):
-        """Send keep-alive realtime triggers if enabled."""
-        if not self._keepalive_enabled or not self.api or not self.api.mqttsession:
+        """Send keep-alive realtime triggers for devices with keepalive enabled."""
+        if not self.api or not self.api.mqttsession:
             return
 
         if not self.api.mqttsession.is_connected():
-            logger.debug("MQTT session not connected, skipping keep-alive triggers")
+            logger.debug("MQTT session not connected, skipping keepalive triggers")
             return
 
         current_time = asyncio.get_event_loop().time()
-        keepalive_interval = 300  # 5 minutes default
+        keepalive_interval = 300  # 5 minutes
 
-        # Check if it's time to send keep-alive triggers
+        # Check if it's time to send keepalive triggers
         if current_time - self._last_keepalive >= keepalive_interval:
-            logger.info("🔄 Sending keep-alive triggers to maintain MQTT session activity")
+            # Get devices with keepalive enabled
+            if not hasattr(self, '_device_keepalive'):
+                self._device_keepalive = {}
 
-            # Send realtime triggers to all MQTT-enabled devices
+            # Send realtime triggers to MQTT-enabled devices with keepalive enabled
             mqtt_devices = [dev for dev in self.api.devices.values() if dev.get("mqtt_described")]
+            enabled_devices = [dev for dev in mqtt_devices if self._device_keepalive.get(dev.get('device_sn'), True)]  # Default enabled
 
-            for dev in mqtt_devices:
+            if not enabled_devices:
+                logger.debug("No devices have keepalive enabled, skipping triggers")
+                return
+
+            logger.info(f"🔄 Sending keepalive triggers for {len(enabled_devices)} enabled devices")
+
+            for dev in enabled_devices:
                 try:
                     device_name = dev.get('name', 'Unknown')
                     device_sn = dev.get('device_sn', 'Unknown')
@@ -413,100 +403,9 @@ class HomeAssistantMqttPublisher:
                     logger.warning(f"Keep-alive trigger error for {dev.get('name', 'Unknown')}: {e}")
 
             self._last_keepalive = current_time
-            logger.info(f"🔄 Keep-alive cycle completed for {len(mqtt_devices)} devices")
+            logger.info(f"🔄 Keepalive cycle completed for {len(enabled_devices)} enabled devices")
 
-    async def _check_and_recover_stale_commands(self):
-        """Check for stale commands and restart MQTT session if needed."""
-        if not self._pending_commands or not self._command_queue_timestamp:
-            return
 
-        current_time = time.time()
-        time_since_commands_added = current_time - self._command_queue_timestamp
-
-        if time_since_commands_added > self._max_command_wait_time:
-            logger.warning(f"🚨 Commands have been pending for {time_since_commands_added:.1f}s (max: {self._max_command_wait_time}s)")
-            logger.warning(f"🚨 {len(self._pending_commands)} commands stuck in queue - restarting MQTT session")
-
-            # Log the stuck commands for debugging
-            for i, (device_sn, command_data) in enumerate(self._pending_commands[:3]):  # Log first 3
-                logger.warning(f"   📋 Stuck command {i+1}: {device_sn} -> {command_data}")
-
-            await self._restart_mqtt_session()
-
-    async def _restart_mqtt_session(self):
-        """Restart the MQTT session to recover from stale state."""
-        try:
-            logger.info("🔄 Restarting MQTT session to recover from stale commands...")
-
-            # Stop current MQTT session
-            if self.api and self.api.mqttsession:
-                self.api.stopMqttSession()
-                await asyncio.sleep(2)  # Give it time to clean up
-
-            # Restart MQTT session
-            if self.api:
-                mqtt_session = await self.api.startMqttSession()
-                if mqtt_session:
-                    # Re-subscribe to devices
-                    for dev in self.api.devices.values():
-                        if dev.get("mqtt_described"):
-                            topic = f"{mqtt_session.get_topic_prefix(deviceDict=dev)}#"
-                            resp = mqtt_session.subscribe(topic)
-                            if resp and resp.is_failure:
-                                logger.warning(f"Failed resubscription for topic: {topic}")
-
-                    # Set up callback again
-                    self.api.mqttsession.message_callback(self.mqtt_message_callback)
-
-                    # Send realtime triggers to wake up devices
-                    await asyncio.sleep(3)  # Wait for connection to stabilize
-
-                    mqtt_devices = [dev for dev in self.api.devices.values() if dev.get("mqtt_described")]
-                    for dev in mqtt_devices:
-                        try:
-                            device_name = dev.get('name', 'Unknown')
-                            device_sn = dev.get('device_sn', 'Unknown')
-
-                            # Send display wake-up command for C1000X devices first
-                            if dev.get('device_pn') == 'A1761':  # C1000X
-                                logger.info(f"💡 Recovery: Sending display wake-up for {device_name}...")
-                                try:
-                                    device = SolixMqttDeviceFactory(self.api, device_sn).create_device()
-                                    if device:
-                                        wake_result = await device.set_display(enabled=True)
-                                        if wake_result:
-                                            logger.info(f"✅ Recovery: Display wake-up successful for {device_name}")
-                                        else:
-                                            logger.warning(f"⚠️ Recovery: Display wake-up failed for {device_name}")
-                                        # Give device time to process wake-up command
-                                        await asyncio.sleep(1)
-                                except Exception as e:
-                                    logger.warning(f"⚠️ Recovery: Display wake-up error for {device_name}: {e}")
-
-                            resp = self.api.mqttsession.realtime_trigger(deviceDict=dev, timeout=30)
-                            if resp and resp.is_published():
-                                logger.info(f"🔔 Recovery trigger sent to {device_name}")
-                            else:
-                                logger.warning(f"❌ Recovery trigger failed for {device_name}")
-                        except Exception as e:
-                            logger.warning(f"Recovery trigger error for {dev.get('name', 'Unknown')}: {e}")
-
-                    # Clear stuck commands and reset timestamp
-                    stuck_count = len(self._pending_commands)
-                    self._pending_commands.clear()
-                    self._command_queue_timestamp = 0
-
-                    # Reset command event
-                    if self._command_event:
-                        self._command_event.clear()
-
-                    logger.info(f"✅ MQTT session restarted successfully, cleared {stuck_count} stuck commands")
-
-                else:
-                    logger.error("❌ Failed to restart MQTT session")
-
-        except Exception as e:
-            logger.error(f"❌ Error during MQTT session restart: {e}", exc_info=True)
 
     def publish_discovery_config(self, device_sn: str, device_info: dict, entity_type: str,
                                entity_name: str, entity_config: dict):
@@ -610,6 +509,13 @@ class HomeAssistantMqttPublisher:
             "payload_not_available": "offline"
         }
 
+        # Special handling for timeout sensors - give them dedicated state topics to avoid appearing as attributes
+        if entity_name in ["device_timeout_minutes", "display_timeout_seconds"]:
+            config["state_topic"] = f"{self.device_prefix}/{device_sn}/{entity_name}"
+            config["value_template"] = "{{ value }}"  # Direct value, not JSON
+            # Remove json_attributes_topic for these sensors
+            config.pop("json_attributes_topic", None)
+
         # Merge with entity-specific configuration
         config.update(entity_config)
 
@@ -638,7 +544,7 @@ class HomeAssistantMqttPublisher:
         common_sensors = {
             "wifi_signal": {
                 "unit_of_measurement": "%",
-                "value_template": "{{ value_json.wifi_signal }}",
+                "value_template": "{{ value_json.wifi_signal | default(0) }}",
                 "icon": "mdi:wifi",
                 "state_class": "measurement"
             },
@@ -656,7 +562,7 @@ class HomeAssistantMqttPublisher:
                 "battery_soc": {
                     "device_class": "battery",
                     "unit_of_measurement": "%",
-                    "value_template": "{{ value_json.battery_soc }}",
+                    "value_template": "{{ value_json.battery_soc | default(0) }}",
                     "state_class": "measurement"
                 },
                 "battery_capacity": {
@@ -766,7 +672,7 @@ class HomeAssistantMqttPublisher:
                 "battery_soc": {
                     "device_class": "battery",
                     "unit_of_measurement": "%",
-                    "value_template": "{{ value_json.battery_soc }}",
+                    "value_template": "{{ value_json.battery_soc | default(0) }}",
                     "state_class": "measurement"
                 },
                 "battery_capacity": {
@@ -778,75 +684,75 @@ class HomeAssistantMqttPublisher:
                 "battery_energy": {
                     "device_class": "energy",
                     "unit_of_measurement": "Wh",
-                    "value_template": "{{ value_json.battery_energy }}",
+                    "value_template": "{{ value_json.battery_energy | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:battery"
                 },
                 "ac_output_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.ac_output_power }}",
+                    "value_template": "{{ value_json.ac_output_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:power-plug"
                 },
                 "ac_output_power_total": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.ac_output_power_total }}",
+                    "value_template": "{{ value_json.ac_output_power_total | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:power-plug"
                 },
                 "dc_input_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.dc_input_power }}",
+                    "value_template": "{{ value_json.dc_input_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:solar-panel"
                 },
                 "grid_to_battery_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.grid_to_battery_power }}",
+                    "value_template": "{{ value_json.grid_to_battery_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:battery-charging"
                 },
                 "usbc_1_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.usbc_1_power }}",
+                    "value_template": "{{ value_json.usbc_1_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:usb"
                 },
                 "usbc_2_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.usbc_2_power }}",
+                    "value_template": "{{ value_json.usbc_2_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:usb"
                 },
                 "usba_1_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.usba_1_power }}",
+                    "value_template": "{{ value_json.usba_1_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:usb"
                 },
                 "usba_2_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.usba_2_power }}",
+                    "value_template": "{{ value_json.usba_2_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:usb"
                 },
                 "temperature": {
                     "device_class": "temperature",
                     "unit_of_measurement": "°C",
-                    "value_template": "{{ value_json.temperature }}",
+                    "value_template": "{{ value_json.temperature | default(0) }}",
                     "state_class": "measurement"
                 },
                 "battery_soh": {
                     "unit_of_measurement": "%",
-                    "value_template": "{{ value_json.battery_soh }}",
+                    "value_template": "{{ value_json.battery_soh | default(100) }}",
                     "state_class": "measurement",
                     "icon": "mdi:battery-heart"
                 },
@@ -973,11 +879,23 @@ class HomeAssistantMqttPublisher:
                     "state_on": "ON",
                     "state_off": "OFF",
                     "entity_category": "config"
+                },
+                "keepalive": {
+                    "name": "Keep-Alive",
+                    "icon": "mdi:heart-pulse",
+                    "command_topic": f"{self.device_prefix}/{device_sn}/command",
+                    "state_topic": f"{self.device_prefix}/{device_sn}/state",
+                    "value_template": "{% if value_json.keepalive_enabled %}ON{% else %}OFF{% endif %}",
+                    "payload_on": '{"command": "keepalive_toggle", "enabled": true}',
+                    "payload_off": '{"command": "keepalive_toggle", "enabled": false}',
+                    "state_on": "ON",
+                    "state_off": "OFF",
+                    "entity_category": "config"
                 }
             })
 
         # Force republish of switches by clearing cache first
-        switches_to_clear = [f"{device_sn}_ac_output", f"{device_sn}_dc_12v_output", f"{device_sn}_ultrafast_charging"]
+        switches_to_clear = [f"{device_sn}_ac_output", f"{device_sn}_dc_12v_output", f"{device_sn}_ultrafast_charging", f"{device_sn}_keepalive"]
         for switch_key in switches_to_clear:
             self.published_discoveries.discard(switch_key)
 
@@ -1092,7 +1010,6 @@ class HomeAssistantMqttPublisher:
         switch_config = {
             "name": "Keep-Alive Mode",
             "icon": "mdi:heart-pulse",
-            "device_class": "switch",
             "command_topic": f"{self.device_prefix}/keepalive/command",
             "state_topic": f"{self.device_prefix}/keepalive/state",
             "value_template": "{% if value_json.keepalive_enabled %}ON{% else %}OFF{% endif %}",
@@ -1131,6 +1048,41 @@ class HomeAssistantMqttPublisher:
         except Exception as e:
             logger.error(f"Error publishing keep-alive switch discovery: {e}")
             return False
+
+    def cleanup_old_global_entities(self):
+        """Clean up old global active polling entities by publishing empty discovery messages."""
+        if not self.mqtt_client:
+            logger.debug("MQTT client not available, skipping cleanup")
+            return
+
+        # List of old global entities to remove
+        old_entities = [
+            ("switch", "active_polling_mode"),
+            ("switch", "keepalive_mode"),
+            ("number", "polling_interval"),
+            ("number", "display_interval"),
+        ]
+
+        logger.info("🧹 Cleaning up old global active polling entities...")
+
+        for entity_type, entity_name in old_entities:
+            discovery_topic = f"{self.ha_discovery_prefix}/{entity_type}/{self.device_prefix}_global/{entity_name}/config"
+            try:
+                result = self.mqtt_client.publish(discovery_topic, "", retain=True)
+                if result.rc == mqtt_client.MQTT_ERR_SUCCESS:
+                    logger.info(f"🧹 Removed old entity: {entity_type}.{self.device_prefix}_{entity_name}")
+                else:
+                    logger.warning(f"Failed to remove old entity {entity_name}: {result.rc}")
+            except Exception as e:
+                logger.error(f"Error removing old entity {entity_name}: {e}")
+
+        # Also clean up the global device availability
+        try:
+            availability_topic = f"{self.device_prefix}/global/availability"
+            self.mqtt_client.publish(availability_topic, "offline", retain=True)
+            logger.info("🧹 Set global device offline")
+        except Exception as e:
+            logger.error(f"Error setting global device offline: {e}")
 
     def publish_device_state(self, device_sn: str, device_info: dict, mqtt_data: dict = None):
         """Publish device state data to MQTT."""
@@ -1177,7 +1129,15 @@ class HomeAssistantMqttPublisher:
             # Set ultrafast charging state
             state_data['ultrafast_charging'] = ultrafast_state
 
-            logger.info(f"🔧 Switch states: AC={state_data.get('ac_output_power_switch', 'N/A')}, DC={state_data.get('dc_output_power_switch', 'N/A')}, Ultra={state_data['ultrafast_charging']}")
+            # Set per-device keepalive state
+            if hasattr(self, '_device_keepalive'):
+                state_data['keepalive_enabled'] = self._device_keepalive.get(device_sn, True)  # Default to enabled
+            else:
+                state_data['keepalive_enabled'] = True  # Default to enabled
+
+            logger.info(f"🔧 Switch states: AC={state_data.get('ac_output_power_switch', 'N/A')}, DC={state_data.get('dc_output_power_switch', 'N/A')}, Ultra={state_data['ultrafast_charging']}, Keepalive={state_data['keepalive_enabled']}")
+
+        # Keep timeout values in state data for now - will be handled specially by timeout sensors
 
         # Add timestamp
         state_data["last_updated"] = datetime.now().isoformat()
@@ -1189,8 +1149,6 @@ class HomeAssistantMqttPublisher:
         # Prepare device attributes for the attributes topic
         device_attributes = {
             "device_sn": device_sn,
-            "device_timeout_minutes": device_info.get('device_timeout_minutes'),
-            "display_timeout_seconds": device_info.get('display_timeout_seconds'),
             "controller_firmware": device_info.get('sw_controller'),
             "expansion_firmware": device_info.get('sw_expansion'),
             "expansion_type": device_info.get('exp_1_type'),
@@ -1216,10 +1174,30 @@ class HomeAssistantMqttPublisher:
         except Exception as e:
             logger.error(f"Error publishing device attributes: {e}")
 
-        # Publish state
+        # Publish dedicated timeout sensor states (to avoid them appearing as attributes)
+        timeout_values = {
+            "device_timeout_minutes": state_data.get('device_timeout_minutes'),
+            "display_timeout_seconds": state_data.get('display_timeout_seconds')
+        }
+        for sensor_name, value in timeout_values.items():
+            if value is not None:
+                timeout_topic = f"{self.device_prefix}/{device_sn}/{sensor_name}"
+                try:
+                    result = self.mqtt_client.publish(timeout_topic, str(value))
+                    if result.rc == mqtt_client.MQTT_ERR_SUCCESS:
+                        logger.debug(f"📤 Published {sensor_name} = {value} to {timeout_topic}")
+                except Exception as e:
+                    logger.error(f"Error publishing {sensor_name}: {e}")
+
+        # Remove timeout values from main state to prevent them appearing as attributes
+        state_data_clean = dict(state_data)
+        state_data_clean.pop('device_timeout_minutes', None)
+        state_data_clean.pop('display_timeout_seconds', None)
+
+        # Publish main state (without timeout values)
         state_topic = f"{self.device_prefix}/{device_sn}/state"
         try:
-            result = self.mqtt_client.publish(state_topic, json.dumps(state_data))
+            result = self.mqtt_client.publish(state_topic, json.dumps(state_data_clean))
             if result.rc == mqtt_client.MQTT_ERR_SUCCESS:
                 logger.info(f"📤 Published state to {state_topic}")
                 logger.debug(f"🔋 State values: battery_soc={state_data.get('battery_soc', 'N/A')}, ac_output_power={state_data.get('ac_output_power', 'N/A')}, temperature={state_data.get('temperature', 'N/A')}")
@@ -1251,7 +1229,7 @@ class HomeAssistantMqttPublisher:
 
         # List of sensors that were moved to device attributes
         removed_sensors = {
-            "device_timeout_minutes", "display_timeout_seconds", "sw_version",
+            "sw_version",
             "sw_controller", "sw_expansion", "exp_1_type", "wifi_mac",
             "bt_mac", "time_zone", "battery_size", "max_load"
         }
@@ -1399,7 +1377,7 @@ class HomeAssistantMqttPublisher:
                 "exp_1_soc": {
                     "device_class": "battery",
                     "unit_of_measurement": "%",
-                    "value_template": "{{ value_json.exp_1_soc }}",
+                    "value_template": "{{ value_json.exp_1_soc | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:battery-plus-variant"
                 },
@@ -1575,13 +1553,13 @@ class HomeAssistantMqttPublisher:
                 "battery_soc": {
                     "device_class": "battery",
                     "unit_of_measurement": "%",
-                    "value_template": "{{ value_json.battery_soc }}",
+                    "value_template": "{{ value_json.battery_soc | default(0) }}",
                     "state_class": "measurement"
                 },
                 "battery_energy": {
                     "device_class": "energy",
                     "unit_of_measurement": "Wh",
-                    "value_template": "{{ value_json.battery_energy }}",
+                    "value_template": "{{ value_json.battery_energy | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:battery"
                 },
@@ -1594,82 +1572,82 @@ class HomeAssistantMqttPublisher:
                 "temperature": {
                     "device_class": "temperature",
                     "unit_of_measurement": "°C",
-                    "value_template": "{{ value_json.temperature }}",
+                    "value_template": "{{ value_json.temperature | default(0) }}",
                     "state_class": "measurement"
                 },
                 "ac_output_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.ac_output_power }}",
+                    "value_template": "{{ value_json.ac_output_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:power-plug"
                 },
                 "ac_output_power_total": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.ac_output_power_total }}",
+                    "value_template": "{{ value_json.ac_output_power_total | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:power-plug"
                 },
                 "dc_input_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.dc_input_power }}",
+                    "value_template": "{{ value_json.dc_input_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:solar-panel"
                 },
                 "grid_to_battery_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.grid_to_battery_power }}",
+                    "value_template": "{{ value_json.grid_to_battery_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:battery-charging"
                 },
                 "usbc_1_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.usbc_1_power }}",
+                    "value_template": "{{ value_json.usbc_1_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:usb"
                 },
                 "usbc_2_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.usbc_2_power }}",
+                    "value_template": "{{ value_json.usbc_2_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:usb"
                 },
                 "usba_1_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.usba_1_power }}",
+                    "value_template": "{{ value_json.usba_1_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:usb"
                 },
                 "usba_2_power": {
                     "device_class": "power",
                     "unit_of_measurement": "W",
-                    "value_template": "{{ value_json.usba_2_power }}",
+                    "value_template": "{{ value_json.usba_2_power | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:usb"
                 },
                 "battery_soh": {
                     "unit_of_measurement": "%",
-                    "value_template": "{{ value_json.battery_soh }}",
+                    "value_template": "{{ value_json.battery_soh | default(100) }}",
                     "state_class": "measurement",
                     "icon": "mdi:battery-heart"
                 },
                 "remaining_time_hours": {
                     "device_class": "duration",
                     "unit_of_measurement": "h",
-                    "value_template": "{{ value_json['remaining_time_hours?'] if value_json['remaining_time_hours?'] is defined else 0 }}",
+                    "value_template": "{{ value_json['remaining_time_hours?'] | default(0) }}",
                     "state_class": "measurement",
                     "icon": "mdi:timer-outline"
                 },
                 "rssi": {
                     "device_class": "signal_strength",
                     "unit_of_measurement": "dBm",
-                    "value_template": "{{ value_json.rssi }}",
+                    "value_template": "{{ value_json.rssi | default(-70) }}",
                     "state_class": "measurement",
                     "icon": "mdi:wifi-strength-2",
                     "entity_category": "diagnostic"
@@ -1893,8 +1871,9 @@ class HomeAssistantMqttPublisher:
         # Initial device discovery and setup
         await self.publish_all_devices(site_id=site_id, enable_mqtt=enable_mqtt)
 
-        # Create keep-alive control switch
-        self.create_keepalive_switch()
+        # Clean up old global active polling entities
+        self.cleanup_old_global_entities()
+
 
         # Setup MQTT callback and realtime triggers if enabled
         if enable_mqtt and self.api.mqttsession:
@@ -1907,21 +1886,12 @@ class HomeAssistantMqttPublisher:
                 # Give MQTT client time to fully connect and subscribe
                 await asyncio.sleep(5)
 
-                # Wait for MQTT client to be properly connected
-                max_wait = 10  # seconds
-                wait_time = 0
-                while wait_time < max_wait:
-                    if self.api.mqttsession.is_connected():
-                        logger.info("✅ MQTT session is connected, proceeding with triggers")
-                        break
-                    logger.debug(f"⏳ Waiting for MQTT connection... ({wait_time}s/{max_wait}s)")
-                    await asyncio.sleep(1)
-                    wait_time += 1
-
+                # Check if MQTT session is connected and ready
                 if not self.api.mqttsession.is_connected():
-                    logger.warning("❌ MQTT session not connected after waiting, skipping realtime triggers")
+                    logger.warning("❌ MQTT session not connected, skipping realtime triggers")
                     # Continue without realtime triggers, callback will still work
                 else:
+                    logger.info("✅ MQTT session is connected, proceeding with triggers")
                     mqtt_devices = [dev for dev in self.api.devices.values() if dev.get("mqtt_described")]
                     if not mqtt_devices:
                         logger.warning("No devices support MQTT realtime triggers")
@@ -1933,7 +1903,7 @@ class HomeAssistantMqttPublisher:
 
                             try:
                                 if not self.api.mqttsession.is_connected():
-                                    logger.warning("MQTT session not connected, skipping realtime trigger")
+                                    logger.debug(f"MQTT session not connected, skipping realtime trigger for {device_name}")
                                     continue
 
                                 # Check if device supports MQTT
@@ -2037,8 +2007,6 @@ class HomeAssistantMqttPublisher:
                         # Timeout reached - check for stale commands first
                         current_time = asyncio.get_event_loop().time()
 
-                        # Check for stale commands and restart MQTT session if needed
-                        await self._check_and_recover_stale_commands()
 
                         # Process any pending commands that might have arrived
                         if self._pending_commands:
