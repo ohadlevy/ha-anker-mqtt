@@ -1279,24 +1279,24 @@ class HomeAssistantMqttPublisher:
             return
 
         if session_data:
-            logger.info(f"📡 Using session cache data: {len(session_data)} fields")
+            logger.debug(f"📡 Using session cache data: {len(session_data)} fields")
             # Update device_info for state publishing
             device_info["mqtt_data"] = mqtt_data
         else:
-            logger.info(f"📡 Using device mqtt_data: {len(mqtt_data)} fields")
+            logger.debug(f"📡 Using device mqtt_data: {len(mqtt_data)} fields")
 
-        logger.info(f"📊 MQTT data sample: {dict(list(mqtt_data.items())[:5])}")
+        logger.debug(f"📊 MQTT data sample: {dict(list(mqtt_data.items())[:5])}")
 
         # Combine device info with MQTT data
         combined_data = dict(device_info)
         combined_data.update(mqtt_data)
 
         logger.info(f"🔄 Processing {device_info.get('name', device_sn)} with {len(mqtt_data)} MQTT fields")
-        logger.info(f"  📡 MQTT fields: {list(mqtt_data.keys())}")
+        logger.debug(f"  📡 MQTT fields: {list(mqtt_data.keys())}")
 
         # Track existing entities for this device
         existing_entities = self.device_entities.get(device_sn, set())
-        logger.info(f"  📊 Existing entities ({len(existing_entities)}): {existing_entities}")
+        logger.debug(f"  📊 Existing entities ({len(existing_entities)}): {existing_entities}")
 
         # Get all potential sensors for this device type
         device_type = device_info.get('type', '')
@@ -1446,8 +1446,8 @@ class HomeAssistantMqttPublisher:
                     field_value = combined_data.get(sensor_name)
                     logger.debug(f"     📊 {sensor_name}: {field_value} (has_data: {has_data})")
 
-        logger.info(f"  🎯 Checking {len(all_possible_sensors)} potential sensors for type '{device_type}'")
-        logger.info(f"  📋 Available MQTT fields: {sorted(combined_data.keys())}")
+        logger.debug(f"  🎯 Checking {len(all_possible_sensors)} potential sensors for type '{device_type}'")
+        logger.debug(f"  📋 Available MQTT fields: {sorted(combined_data.keys())}")
 
         new_entities = set()
         for sensor_name, sensor_config in all_possible_sensors.items():
@@ -1789,7 +1789,7 @@ class HomeAssistantMqttPublisher:
                 # Get MQTT data if available and create additional sensors
                 mqtt_data = device_info.get("mqtt_data", {}) if mqtt_session else {}
                 if mqtt_data:
-                    logger.info(f"📡 Found existing MQTT data with {len(mqtt_data)} fields - creating sensors now")
+                    logger.debug(f"📡 Found existing MQTT data with {len(mqtt_data)} fields - creating sensors now")
                     self.update_sensors_from_mqtt_data(device_sn, device_info)
                 else:
                     logger.info("📡 No MQTT data yet - will create sensors when data arrives")
@@ -1843,19 +1843,19 @@ class HomeAssistantMqttPublisher:
             logger.info(f"📊 Received empty data from {topic_name}")
             # Log if data exists but in different format
             if data is not None:
-                logger.info(f"   🔍 Data is not None but not dict-like: {type(data)} = {str(data)[:100]}")
+                logger.debug(f"   🔍 Data is not None but not dict-like: {type(data)} = {str(data)[:100]}")
 
         # Also log the raw MQTT session cache data for comparison
         if device_sn and self.api.mqttsession and hasattr(self.api.mqttsession, 'mqtt_data'):
             session_data = self.api.mqttsession.mqtt_data.get(device_sn, {})
             if session_data:
-                logger.info(f"🗄️ Session cache has {len(session_data)} fields")
+                logger.debug(f"🗄️ Session cache has {len(session_data)} fields")
                 session_sample = {k: session_data.get(k) for k in ['ac_output_power', 'usbc_1_power', 'battery_soc'] if k in session_data}
-                logger.info(f"🗄️ Session cache sample: {session_sample}")
+                logger.debug(f"🗄️ Session cache sample: {session_sample}")
             else:
-                logger.info(f"🗄️ Session cache is empty for device {device_sn}")
+                logger.debug(f"🗄️ Session cache is empty for device {device_sn}")
         else:
-            logger.info(f"🗄️ No session cache available")
+            logger.debug(f"🗄️ No session cache available")
 
         if device_sn:
             try:
@@ -1920,7 +1920,7 @@ class HomeAssistantMqttPublisher:
                                 # Check if device supports MQTT
                                 mqtt_supported = dev.get("mqtt_supported", False)
                                 mqtt_described = dev.get("mqtt_described", False)
-                                logger.info(f"🔍 Device {device_name}: mqtt_supported={mqtt_supported}, mqtt_described={mqtt_described}")
+                                logger.debug(f"🔍 Device {device_name}: mqtt_supported={mqtt_supported}, mqtt_described={mqtt_described}")
 
                                 if not mqtt_described:
                                     logger.warning(f"⚠️ Device {device_name} doesn't support MQTT realtime triggers")
