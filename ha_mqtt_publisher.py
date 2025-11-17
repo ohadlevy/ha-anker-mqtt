@@ -37,9 +37,30 @@ try:
 except ImportError:
     DOTENV_AVAILABLE = False
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Configure logging with environment variable support
+def setup_logging(debug_flag=False):
+    """Setup logging with configurable level via environment variable or command line."""
+    # Default to INFO level
+    log_level = logging.INFO
+
+    # Command line debug flag takes precedence
+    if debug_flag:
+        log_level = logging.DEBUG
+    else:
+        # Check for LOG_LEVEL environment variable
+        env_log_level = os.getenv('LOG_LEVEL', '').upper()
+        if env_log_level in ['DEBUG', 'INFO', 'WARNING', 'ERROR']:
+            log_level = getattr(logging, env_log_level)
+
+    # Clear any existing handlers and reconfigure
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+    return logging.getLogger(__name__)
+
+# Initialize logger with default settings
+logger = setup_logging()
 
 def load_credentials(env_file: Optional[str] = None) -> Dict[str, Optional[str]]:
     """Load credentials from environment variables or .env file."""
@@ -2106,6 +2127,8 @@ def parse_arguments():
                        help="Enable MQTT session for real-time device data (event-driven updates)")
     parser.add_argument("--rt", "--realtime", action="store_true",
                        help="Enable real-time MQTT trigger to request immediate data (requires --mqtt)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging (shows detailed diagnostic information)")
     parser.add_argument("--interval", "-i", type=int, default=30,
                        help="Polling interval in seconds when MQTT is disabled, or fallback interval when MQTT is enabled (default: 30)")
     parser.add_argument("--site-id", type=str,
@@ -2143,6 +2166,12 @@ def parse_arguments():
 async def main():
     """Main function."""
     args = parse_arguments()
+
+    # Reconfigure logging if debug flag is set
+    if args.debug:
+        global logger
+        logger = setup_logging(debug_flag=True)
+        logger.debug("Debug logging enabled")
 
     # Load credentials from environment or .env file
     credentials = load_credentials(args.env_file)
