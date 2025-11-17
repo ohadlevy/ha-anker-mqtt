@@ -1302,65 +1302,76 @@ class HomeAssistantMqttPublisher:
         device_type = device_info.get('type', '')
         all_possible_sensors = self._get_sensor_definitions(device_type)
 
-        # Add expansion sensors only if expansion pack is installed
-        # Enhanced debugging for expansion pack detection
-        expansion_fields = {
-            'expansion_packs': combined_data.get('expansion_packs'),
-            'expansion_packs_a?': combined_data.get('expansion_packs_a?'),
-            'expansion_packs_b?': combined_data.get('expansion_packs_b?'),
-            'expansion_packs_c?': combined_data.get('expansion_packs_c?'),
-            'exp_1_soc': combined_data.get('exp_1_soc'),
-            'exp_1_soh': combined_data.get('exp_1_soh'),
-            'exp_1_type': combined_data.get('exp_1_type'),
-            'exp_1_temperature': combined_data.get('exp_1_temperature'),
-            'battery_soc_total': combined_data.get('battery_soc_total'),
-            'sw_expansion': combined_data.get('sw_expansion'),
-        }
+        # Only run expansion detection on first setup for this device
+        is_first_setup = len(existing_entities) == 0
+        if is_first_setup:
+            # Add expansion sensors only if expansion pack is installed
+            expansion_fields = {
+                'expansion_packs': combined_data.get('expansion_packs'),
+                'expansion_packs_a?': combined_data.get('expansion_packs_a?'),
+                'expansion_packs_b?': combined_data.get('expansion_packs_b?'),
+                'expansion_packs_c?': combined_data.get('expansion_packs_c?'),
+                'exp_1_soc': combined_data.get('exp_1_soc'),
+                'exp_1_soh': combined_data.get('exp_1_soh'),
+                'exp_1_type': combined_data.get('exp_1_type'),
+                'exp_1_temperature': combined_data.get('exp_1_temperature'),
+                'battery_soc_total': combined_data.get('battery_soc_total'),
+                'sw_expansion': combined_data.get('sw_expansion'),
+            }
 
-        logger.info(f"🔍 EXPANSION DEBUG - All expansion-related fields for {device_sn}:")
-        for field, value in expansion_fields.items():
-            if value is not None:
-                logger.info(f"   📊 {field}: {value} (type: {type(value)})")
-            else:
-                logger.info(f"   ❌ {field}: None")
+            logger.debug(f"🔍 EXPANSION DEBUG - All expansion-related fields for {device_sn}:")
+            for field, value in expansion_fields.items():
+                if value is not None:
+                    logger.debug(f"   📊 {field}: {value} (type: {type(value)})")
+                else:
+                    logger.debug(f"   ❌ {field}: None")
 
-        expansion_packs = combined_data.get('expansion_packs', 0)
-        # Also check alternative expansion pack fields
-        alt_expansion_indicators = [
-            combined_data.get('expansion_packs_a?'),
-            combined_data.get('expansion_packs_b?'),
-            combined_data.get('expansion_packs_c?')
-        ]
+            expansion_packs = combined_data.get('expansion_packs', 0)
+            # Also check alternative expansion pack fields
+            alt_expansion_indicators = [
+                combined_data.get('expansion_packs_a?'),
+                combined_data.get('expansion_packs_b?'),
+                combined_data.get('expansion_packs_c?')
+            ]
 
-        # Check if any expansion indicator suggests expansion pack is present
-        has_expansion = False
-        if expansion_packs and int(expansion_packs) > 0:
-            has_expansion = True
-            logger.info(f"🔋 EXPANSION DEBUG - Detected via 'expansion_packs': {expansion_packs}")
-        elif any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None):
-            has_expansion = True
-            logger.info(f"🔋 EXPANSION DEBUG - Detected via alternative fields: {alt_expansion_indicators}")
-        elif combined_data.get('exp_1_soc') is not None and int(combined_data.get('exp_1_soc', 0)) > 0:
-            has_expansion = True
-            logger.info(f"🔋 EXPANSION DEBUG - Detected via exp_1_soc with charge: {combined_data.get('exp_1_soc')}")
-        elif combined_data.get('exp_1_type') and str(combined_data.get('exp_1_type', '')).strip() and combined_data.get('exp_1_type') != '0':
-            # Check if exp_1_type has meaningful content (not empty, not "0")
-            exp_type = str(combined_data.get('exp_1_type', '')).strip()
-            if exp_type and exp_type != '0' and any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None):
-                has_expansion = True
-                logger.info(f"🔋 EXPANSION DEBUG - Detected via exp_1_type with alt indicators: {exp_type}")
-            else:
-                logger.info(f"🔋 EXPANSION DEBUG - exp_1_type exists but no other indicators: {exp_type}")
-
-        # Additional safeguard: if exp_1_soc is 0 and all alt indicators are 0, likely no expansion
-        if (combined_data.get('exp_1_soc') == 0 and
-            all(not val or int(val or 0) == 0 for val in alt_expansion_indicators)):
-            logger.info(f"🔋 EXPANSION DEBUG - All expansion indicators are 0 - likely no expansion installed")
+            # Check if any expansion indicator suggests expansion pack is present
             has_expansion = False
+            if expansion_packs and int(expansion_packs) > 0:
+                has_expansion = True
+                logger.debug(f"🔋 EXPANSION DEBUG - Detected via 'expansion_packs': {expansion_packs}")
+            elif any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None):
+                has_expansion = True
+                logger.debug(f"🔋 EXPANSION DEBUG - Detected via alternative fields: {alt_expansion_indicators}")
+            elif combined_data.get('exp_1_soc') is not None and int(combined_data.get('exp_1_soc', 0)) > 0:
+                has_expansion = True
+                logger.debug(f"🔋 EXPANSION DEBUG - Detected via exp_1_soc with charge: {combined_data.get('exp_1_soc')}")
+            elif combined_data.get('exp_1_type') and str(combined_data.get('exp_1_type', '')).strip() and combined_data.get('exp_1_type') != '0':
+                # Check if exp_1_type has meaningful content (not empty, not "0")
+                exp_type = str(combined_data.get('exp_1_type', '')).strip()
+                if exp_type and exp_type != '0' and any(val and int(val or 0) > 0 for val in alt_expansion_indicators if val is not None):
+                    has_expansion = True
+                    logger.debug(f"🔋 EXPANSION DEBUG - Detected via exp_1_type with alt indicators: {exp_type}")
+                else:
+                    logger.debug(f"🔋 EXPANSION DEBUG - exp_1_type exists but no other indicators: {exp_type}")
 
-        logger.info(f"🔋 EXPANSION DEBUG - Final decision: has_expansion={has_expansion}")
+            # Additional safeguard: if exp_1_soc is 0 and all alt indicators are 0, likely no expansion
+            if (combined_data.get('exp_1_soc') == 0 and
+                all(not val or int(val or 0) == 0 for val in alt_expansion_indicators)):
+                logger.debug(f"🔋 EXPANSION DEBUG - All expansion indicators are 0 - likely no expansion installed")
+                has_expansion = False
 
-        if has_expansion:
+            logger.info(f"🔋 Expansion pack detected: {has_expansion}")
+
+        # Always check for expansion sensors (use simple detection for ongoing updates)
+        if is_first_setup:
+            # Full expansion detection on first setup
+            expansion_detected = has_expansion
+        else:
+            # Simple check for ongoing updates
+            expansion_detected = (combined_data.get('expansion_packs', 0) and int(combined_data.get('expansion_packs', 0)) > 0) or \
+                               (combined_data.get('exp_1_soc') is not None and int(combined_data.get('exp_1_soc', 0)) > 0)
+
+        if expansion_detected:
             expansion_sensors = {
                 "battery_soc_total": {
                     "device_class": "battery",
@@ -1407,8 +1418,8 @@ class HomeAssistantMqttPublisher:
                 }
             }
             all_possible_sensors.update(expansion_sensors)
-            logger.info(f"  🔋 EXPANSION DEBUG - Adding expansion sensors")
-            logger.info(f"  🔋 EXPANSION DEBUG - Added sensor types: {list(expansion_sensors.keys())}")
+            logger.debug(f"  🔋 EXPANSION DEBUG - Adding expansion sensors")
+            logger.debug(f"  🔋 EXPANSION DEBUG - Added sensor types: {list(expansion_sensors.keys())}")
 
             # Log which expansion sensors will actually have data
             for sensor_name, sensor_config in expansion_sensors.items():
@@ -1418,7 +1429,7 @@ class HomeAssistantMqttPublisher:
                     if field_name:
                         has_data = field_name in combined_data
                         field_value = combined_data.get(field_name)
-                        logger.info(f"     📊 {sensor_name} -> {field_name}: {field_value} (has_data: {has_data})")
+                        logger.debug(f"     📊 {sensor_name} -> {field_name}: {field_value} (has_data: {has_data})")
 
                         # Special note for battery_soc_total
                         if sensor_name == "battery_soc_total" and field_name == "battery_soc_total" and not has_data:
@@ -1426,14 +1437,14 @@ class HomeAssistantMqttPublisher:
                             exp_soc = combined_data.get('exp_1_soc')
                             if main_soc is not None and exp_soc is not None:
                                 calculated_total = round((int(main_soc) + int(exp_soc)) / 2)
-                                logger.info(f"     ℹ️ Note: Device doesn't provide battery_soc_total field - will calculate from individual batteries")
-                                logger.info(f"     ℹ️ Calculation: main={main_soc}% + expansion={exp_soc}% = total={calculated_total}% (equal 1056Wh capacities)")
+                                logger.debug(f"     ℹ️ Note: Device doesn't provide battery_soc_total field - will calculate from individual batteries")
+                                logger.debug(f"     ℹ️ Calculation: main={main_soc}% + expansion={exp_soc}% = total={calculated_total}% (equal 1056Wh capacities)")
                             else:
-                                logger.info(f"     ℹ️ Note: Device doesn't provide battery_soc_total field - will show main battery_soc instead")
-                                logger.info(f"     ℹ️ Individual batteries: main={main_soc}%, expansion={exp_soc}%")
+                                logger.debug(f"     ℹ️ Note: Device doesn't provide battery_soc_total field - will show main battery_soc instead")
+                                logger.debug(f"     ℹ️ Individual batteries: main={main_soc}%, expansion={exp_soc}%")
                 else:
                     field_value = combined_data.get(sensor_name)
-                    logger.info(f"     📊 {sensor_name}: {field_value} (has_data: {has_data})")
+                    logger.debug(f"     📊 {sensor_name}: {field_value} (has_data: {has_data})")
 
         logger.info(f"  🎯 Checking {len(all_possible_sensors)} potential sensors for type '{device_type}'")
         logger.info(f"  📋 Available MQTT fields: {sorted(combined_data.keys())}")
@@ -1512,11 +1523,11 @@ class HomeAssistantMqttPublisher:
                 cleanup_has_expansion = False
 
             if not cleanup_has_expansion:
-                logger.info(f"🧹 EXPANSION DEBUG - Cleaning up expansion sensors")
-                logger.info(f"🧹 Cleanup detection fields: {cleanup_expansion_fields}")
+                logger.debug(f"🧹 EXPANSION DEBUG - Cleaning up expansion sensors")
+                logger.debug(f"🧹 Cleanup detection fields: {cleanup_expansion_fields}")
                 self._cleanup_expansion_sensors(device_sn)
             else:
-                logger.info(f"🔋 EXPANSION DEBUG - Keeping expansion sensors (expansion detected during cleanup check)")
+                logger.debug(f"🔋 EXPANSION DEBUG - Keeping expansion sensors (expansion detected during cleanup check)")
 
             self._cleanup_done.add(cleanup_key)
 
@@ -1720,11 +1731,11 @@ class HomeAssistantMqttPublisher:
                 mqtt_session = await self.api.startMqttSession()
                 if mqtt_session:
                     # Subscribe to devices
-                    logger.info("🔍 DEBUG - MQTT Session Details:")
-                    logger.info(f"   📋 MQTT session type: {type(mqtt_session)}")
-                    logger.info(f"   🔌 Is connected: {mqtt_session.is_connected() if hasattr(mqtt_session, 'is_connected') else 'Unknown'}")
+                    logger.debug("🔍 DEBUG - MQTT Session Details:")
+                    logger.debug(f"   📋 MQTT session type: {type(mqtt_session)}")
+                    logger.debug(f"   🔌 Is connected: {mqtt_session.is_connected() if hasattr(mqtt_session, 'is_connected') else 'Unknown'}")
                     if hasattr(mqtt_session, '__dict__'):
-                        logger.info(f"   📊 Session attributes: {list(mqtt_session.__dict__.keys())}")
+                        logger.debug(f"   📊 Session attributes: {list(mqtt_session.__dict__.keys())}")
 
                     for dev in self.api.devices.values():
                         if dev.get("mqtt_described"):
@@ -1733,17 +1744,17 @@ class HomeAssistantMqttPublisher:
                             topic_prefix = mqtt_session.get_topic_prefix(deviceDict=dev)
                             topic = f"{topic_prefix}#"
 
-                            logger.info(f"🔍 DEBUG - Subscribing to device {device_name}:")
-                            logger.info(f"   📍 Topic prefix: {topic_prefix}")
-                            logger.info(f"   🎯 Full topic: {topic}")
+                            logger.debug(f"🔍 DEBUG - Subscribing to device {device_name}:")
+                            logger.debug(f"   📍 Topic prefix: {topic_prefix}")
+                            logger.debug(f"   🎯 Full topic: {topic}")
 
                             resp = mqtt_session.subscribe(topic)
 
-                            logger.info(f"   📋 Subscription response: {type(resp) if resp else None}")
+                            logger.debug(f"   📋 Subscription response: {type(resp) if resp else None}")
                             if resp:
-                                logger.info(f"   ✅ Success: {not resp.is_failure if hasattr(resp, 'is_failure') else 'Unknown'}")
+                                logger.debug(f"   ✅ Success: {not resp.is_failure if hasattr(resp, 'is_failure') else 'Unknown'}")
                                 if hasattr(resp, '__dict__'):
-                                    logger.info(f"   📊 Response attributes: {list(resp.__dict__.keys())}")
+                                    logger.debug(f"   📊 Response attributes: {list(resp.__dict__.keys())}")
 
                             if resp and resp.is_failure:
                                 logger.warning(f"Failed subscription for topic: {topic}")
@@ -1799,21 +1810,21 @@ class HomeAssistantMqttPublisher:
         logger.debug(f"📋 Full topic: {topic}")
 
         # ENHANCED DEBUGGING: Log raw message details
-        logger.info(f"🔍 DEBUG - Raw MQTT message details:")
-        logger.info(f"   📍 Full topic: {topic}")
-        logger.info(f"   📦 Message type: {type(message)}")
-        logger.info(f"   📊 Data type: {type(data)}")
-        logger.info(f"   🔢 Model: {model}")
-        logger.info(f"   🆔 Device SN: {device_sn}")
-        logger.info(f"   🔄 Value update flag: {valueupdate}")
+        logger.debug(f"🔍 DEBUG - Raw MQTT message details:")
+        logger.debug(f"   📍 Full topic: {topic}")
+        logger.debug(f"   📦 Message type: {type(message)}")
+        logger.debug(f"   📊 Data type: {type(data)}")
+        logger.debug(f"   🔢 Model: {model}")
+        logger.debug(f"   🆔 Device SN: {device_sn}")
+        logger.debug(f"   🔄 Value update flag: {valueupdate}")
 
         # Log raw message content if available
         if hasattr(message, 'payload'):
             try:
                 payload_str = message.payload.decode('utf-8', errors='replace') if isinstance(message.payload, bytes) else str(message.payload)
-                logger.info(f"   📥 Raw payload: {payload_str[:200]}{'...' if len(payload_str) > 200 else ''}")
+                logger.debug(f"   📥 Raw payload: {payload_str[:200]}{'...' if len(payload_str) > 200 else ''}")
             except Exception as e:
-                logger.info(f"   📥 Raw payload decode error: {e}")
+                logger.debug(f"   📥 Raw payload decode error: {e}")
 
         # Log what data we received
         if hasattr(data, 'keys') and len(data) > 0:
@@ -1938,29 +1949,29 @@ class HomeAssistantMqttPublisher:
 
                                 logger.info(f"📡 Sending realtime trigger for {device_name}...")
                                 # DEBUG: Log what we're about to send
-                                logger.info(f"🔍 DEBUG - Realtime trigger details:")
-                                logger.info(f"   🎯 Target device: {device_name} ({device_sn})")
-                                logger.info(f"   🏷️ Device PN: {dev.get('device_pn')}")
-                                logger.info(f"   📡 MQTT described: {dev.get('mqtt_described')}")
-                                logger.info(f"   🔌 MQTT supported: {dev.get('mqtt_supported')}")
-                                logger.info(f"   ⏱️ Timeout: 60s")
+                                logger.debug(f"🔍 DEBUG - Realtime trigger details:")
+                                logger.debug(f"   🎯 Target device: {device_name} ({device_sn})")
+                                logger.debug(f"   🏷️ Device PN: {dev.get('device_pn')}")
+                                logger.debug(f"   📡 MQTT described: {dev.get('mqtt_described')}")
+                                logger.debug(f"   🔌 MQTT supported: {dev.get('mqtt_supported')}")
+                                logger.debug(f"   ⏱️ Timeout: 60s")
 
                                 resp = self.api.mqttsession.realtime_trigger(
                                     deviceDict=dev, timeout=60
                                 )
 
                                 # DEBUG: Log the response
-                                logger.info(f"🔍 DEBUG - Realtime trigger response:")
-                                logger.info(f"   📋 Response object: {type(resp)}")
-                                logger.info(f"   ✅ Response exists: {resp is not None}")
+                                logger.debug(f"🔍 DEBUG - Realtime trigger response:")
+                                logger.debug(f"   📋 Response object: {type(resp)}")
+                                logger.debug(f"   ✅ Response exists: {resp is not None}")
                                 if resp:
-                                    logger.info(f"   📤 Is published: {resp.is_published() if hasattr(resp, 'is_published') else 'No is_published method'}")
+                                    logger.debug(f"   📤 Is published: {resp.is_published() if hasattr(resp, 'is_published') else 'No is_published method'}")
                                     if hasattr(resp, '__dict__'):
-                                        logger.info(f"   📊 Response attributes: {list(resp.__dict__.keys())}")
+                                        logger.debug(f"   📊 Response attributes: {list(resp.__dict__.keys())}")
                                     if hasattr(resp, 'topic'):
-                                        logger.info(f"   📍 Sent to topic: {resp.topic}")
+                                        logger.debug(f"   📍 Sent to topic: {resp.topic}")
                                     if hasattr(resp, 'payload'):
-                                        logger.info(f"   📦 Payload: {str(resp.payload)[:100]}")
+                                        logger.debug(f"   📦 Payload: {str(resp.payload)[:100]}")
                                 else:
                                     logger.warning(f"   ❌ No response object returned")
 
